@@ -195,6 +195,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
     auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
+    auto const isMegaKernelModel = parseJsonFieldOr(pluginConfig, "megakernel model", false)
 
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
@@ -206,6 +207,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
+    modelConfig.setMegaKernelModel(isMegaKernelModel);
 }
 
 void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,

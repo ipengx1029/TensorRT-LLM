@@ -86,6 +86,7 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
 
     bool transformerBased = modelConfig.isTransformerBased();
     bool rnnBased = modelConfig.isRnnBased();
+    bool megaKernelModel = modelConfig.isMegaKernelModel();      
 
     contextLengthsHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
     if (transformerBased)

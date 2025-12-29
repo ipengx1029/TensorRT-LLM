@@ -32,6 +32,15 @@ GenerationConfig GenerationConfig::fromInput(ITensor const& inputIds, ITensor& i
 
     auto const& inputShape = inputIds.getShape();
     SizeType32 inputLengthSum{0};
+
+    std::vector<SizeType32> accumulatedInputLength{0};
+    SizeType32 tmpInputLengthSum = 0;
+    for (int i = 0; i < batchSize; ++i) {
+        tmpInputLengthSum += inputLengthsHostBuffer[i];
+        accumulatedInputLength.emplace_back(tmpInputLengthSum);
+    }
+    TLLM_LOG_WARNING("GenerationConfig::fromInput inputPacked: %d", inputPacked);
+
     if (inputPacked)
     {
         inputLengthSum = std::accumulate(inputLengthsHostBuffer.begin(), inputLengthsHostBuffer.begin() + batchSize, 0);
@@ -65,5 +74,5 @@ GenerationConfig GenerationConfig::fromInput(ITensor const& inputIds, ITensor& i
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return GenerationConfig{
-        batchSize, beamWidth, maxInputLength, maxAttentionWindow, sinkTokenLength, maxSequenceLength, inputLengthSum};
+        batchSize, beamWidth, maxInputLength, maxAttentionWindow, sinkTokenLength, maxSequenceLength, inputLengthSum, accumulatedInputLength};
 }

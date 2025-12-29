@@ -96,6 +96,7 @@ class PluginConfig:
     multiple_profiles: bool = False
     paged_state: bool = True
     streamingllm: bool = False
+    megakernel_model: bool = False
 
     def set_plugin(self, name: str, value: Union[str, bool, int]):
         assert hasattr(self, name), f"Plugin name doesn't exist: {name}"

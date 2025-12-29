@@ -29,7 +29,7 @@ public:
 
     explicit GenerationConfig(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxInputLength,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSeqLength,
-        SizeType32 inputLengthSum = SizeType32(0))
+        SizeType32 inputLengthSum = SizeType32(0), const std::vector<SizeType32> &accumulatedInputLength = std::vector<SizeType32>())
         : batchSize{batchSize}
         , beamWidth{beamWidth}
         , maxInputLength{maxInputLength}
@@ -37,6 +37,7 @@ public:
         , sinkTokenLength{sinkTokenLength}
         , maxSeqLength{maxSeqLength}
         , inputLengthSum{inputLengthSum}
+        , accumulatedInputLength(accumulatedInputLength)
     {
     }
 
@@ -47,6 +48,7 @@ public:
     SizeType32 sinkTokenLength{};
     SizeType32 maxSeqLength{};
     SizeType32 inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
+    std::vector<SizeType32> accumulatedInputLength;
 
     static GenerationConfig fromInput(ITensor const& inputIds, ITensor& inputLengths, bool inputPacked,
         SizeType32 beamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength);

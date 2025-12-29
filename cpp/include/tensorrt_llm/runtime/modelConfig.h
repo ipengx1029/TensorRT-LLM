@@ -86,6 +86,7 @@ public:
         , mUseCrossAttention(false)
         , mUsePositionEmbedding(true) // TODO: remove these two properties?
         , mUseTokenTypeEmbedding(false)
+        , mMegaKernelModel(false)
     {
     }
 
@@ -483,6 +484,15 @@ public:
         }
     }
 
+    void constexpr setMegaKernelModel(bool isMegakernelModel) noexcept 
+    {
+        mMegaKernelModel = isMegakernelModel;
+    }
+    [[nodiscard]] bool constexpr isMegaKernelModel() const noexcept 
+    {
+        return mMegaKernelModel;
+    }
+
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
     {
         return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm
@@ -566,7 +576,7 @@ private:
     bool mUsePositionEmbedding;
     bool mUseTokenTypeEmbedding;
     SizeType32 mFfnHiddenSize; // indicates encoder output hidden size
-
+    bool mMegaKernelModel;
     std::vector<LayerType> mLayerTypes;
 };
 

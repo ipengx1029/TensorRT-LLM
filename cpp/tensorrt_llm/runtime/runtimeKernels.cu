@@ -1051,7 +1051,7 @@ void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& 
 
 template <typename T>
 __global__ void gatherLastTokenLogitsKernel(T* lastTokenLogits, T const* logits, int const* lastTokenIds,
-    int maxInputLength, int beamWidth, int vocabSizePadded)
+    int beamWidth, int vocabSizePadded)
 {
     // This sequence.
     int seqIdx = blockIdx.x;
@@ -1088,13 +1088,17 @@ void invokeGatherLastTokenLogits(
     auto const& inputShape = input.getShape();
     auto const maxInputLength = static_cast<std::uint32_t>(inputShape.d[1]);
 
-    TLLM_CHECK_WITH_INFO(inputShape.d[0] == batchSize, "Invalid input shape: dim[0]");
-    TLLM_CHECK_WITH_INFO(inputShape.d[2] == vocabSizePadded, "Invalid input shape: dim[2]");
+    if (inputShape.nbDims == outputShape.nbDims) {
+        TLLM_CHECK_WITH_INFO(inputShape.d[0] == batchSize, "Invalid input shape: dim[0]");
+        TLLM_CHECK_WITH_INFO(inputShape.d[2] == vocabSizePadded, "Invalid input shape: dim[2]");
+    } else {
+        TLLM_CHECK_WITH_INFO(inputShape[1] == vocabSizePadded, "Invalid input shape: dim[1]");    // (xp) for mk remove_padding
+    }
 
     dim3 const blockSize{256, 1};
     dim3 const gridSize{static_cast<std::uint32_t>(batchSize), 1};
     gatherLastTokenLogitsKernel<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<T>(output), bufferCast<T>(input),
-        bufferCast<int32_t>(lastTokenIds), static_cast<std::uint32_t>(maxInputLength),
+        bufferCast<int32_t>(lastTokenIds),
         static_cast<std::uint32_t>(beamWidth), vocabSizePadded);
 }
 

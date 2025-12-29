@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/rnnStateBuffers.h"
 #include "tensorrt_llm/runtime/transformerBuffers.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include "tensorrt_llm/runtime/mkBuffers.h"
 
 #include <array>
 #include <vector>
@@ -89,6 +90,9 @@ public:
 
     // Transformer model buffer
     std::optional<TransformerBuffers> transformerBuffers;
+
+    // MegaKernel model buffer
+    std::optional<MKBuffers> mkBuffers;
 
     // Prompt tuning
     PromptTuningParams promptTuningParams;
