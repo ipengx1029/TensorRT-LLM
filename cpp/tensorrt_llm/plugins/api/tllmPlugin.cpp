@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
+#include "tensorrt_llm/plugins/mkPlugin/mkPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
@@ -171,6 +172,7 @@ extern "C"
     {
         static tensorrt_llm::plugins::IdentityPluginCreator identityPluginCreator;
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
+        static tensorrt_llm::plugins::MkPluginCreator mkPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
         static tensorrt_llm::plugins::MixtureOfExpertsPluginCreator moePluginCreator;
@@ -199,6 +201,7 @@ extern "C"
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
                   creatorPtr(bertAttentionPluginCreator),
+                  creatorPtr(mkPluginCreator),
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
                   creatorPtr(moePluginCreator),

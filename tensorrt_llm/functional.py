@@ -35,6 +35,8 @@ from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
+from dataclasses import dataclass, field
+
 
 class DimRange(object):
     '''

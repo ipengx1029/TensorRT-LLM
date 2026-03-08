@@ -36,6 +36,7 @@ from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
+from qwen_mk.model import Qwen3MegaKernel
 
 __all__ = [
     'BertModel',
