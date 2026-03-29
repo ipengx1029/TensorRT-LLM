@@ -12,7 +12,8 @@ namespace tc = tensorrt_llm::common;
 MKBuffers::MKBuffers() {
     k_cache = nullptr;
     v_cache = nullptr;
-    logits = nullptr;
+    logits_from_mk_buffer = nullptr;
+    logits_ptr_in_use = nullptr;
     bs_params = nullptr;
     input_lengths = nullptr;
 }
@@ -24,7 +25,8 @@ MKBuffers::MKBuffers(TllmRuntime const& runtime, runtime::ModelConfig const& mod
     modelDtype = nvinfer1::DataType::kBF16;
     k_cache = manager.emptyTensor(MemoryType::kGPU, modelDtype);
     v_cache = manager.emptyTensor(MemoryType::kGPU, modelDtype);
-    logits = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    logits_from_mk_buffer = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    logits_ptr_in_use = logits_from_mk_buffer;
     bs_params = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     input_lengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
 }
@@ -39,7 +41,7 @@ void MKBuffers::reshape(GenerationConfig const& generationConfig, ModelConfig co
     if (inputLengthSum == 0) {
         return;
     }
-    
+    auto const maxBatchSize = modelConfig.getMaxBatchSize();
     const auto max_tokens = modelConfig.getMaxSequenceLen();
     const auto num_layer = modelConfig.getNbAttentionLayers();
     const auto num_kv_head = modelConfig.getNbKvHeads();
@@ -56,12 +58,13 @@ void MKBuffers::reshape(GenerationConfig const& generationConfig, ModelConfig co
     TLLM_LOG_TRACE("vocabSize: %d", vocabSize);
 
     auto const kvCacheReserve = ITensor::makeShape(
-        {num_layer * batchSize, max_tokens, num_kv_head, head_size}
+        {num_layer * maxBatchSize, max_tokens, num_kv_head, head_size}
     );
 
     k_cache->reshape(kvCacheReserve);
     v_cache->reshape(kvCacheReserve);
-    logits->reshape(ITensor::makeShape({inputLengthSum, vocabSize}));
+    logits_from_mk_buffer->reshape(ITensor::makeShape({inputLengthSum, vocabSize}));
+    logits_ptr_in_use = logits_from_mk_buffer;
     bs_params->reshape(ITensor::makeShape({batchSize, 3}));
     input_lengths->reshape(ITensor::makeShape({batchSize}));
 }
@@ -93,7 +96,7 @@ MKBuffers MKBuffers::sliceTo(GenerationConfig const& generationConfig, ModelConf
     SizeType32 maxInputOffset = generationConfig.accumulatedInputLength[offset];
     SizeType32 maxInputStep = generationConfig.accumulatedInputLength[offset + batchSize] - maxInputOffset;
 
-    buffers.logits = ITensor::slice(logits, maxInputOffset, maxInputStep);
+    buffers.logits_ptr_in_use = ITensor::slice(logits_ptr_in_use, maxInputOffset, maxInputStep);
     buffers.bs_params = ITensor::slice(bs_params, offset, batchSize);
     buffers.input_lengths = ITensor::slice(input_lengths, offset, batchSize);
     return buffers;
@@ -107,7 +110,7 @@ ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
 
 void MKBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers, 
 BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
-    kernels::gatherLastTokenLogits(*(runtimeBuffers->logits), *logits, *(runtimeBuffers->lastTokenIds), manager.getStream());
+    kernels::gatherLastTokenLogits(*(runtimeBuffers->logits), *logits_ptr_in_use, *(runtimeBuffers->lastTokenIds), manager.getStream());
 }
 
 void MKBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step, BufferManager& manager,
@@ -127,7 +130,7 @@ void MKBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step,
 
     seq_len_ += new_token_num;
     runtimeBuffers->logits->reshape(ITensor::makeShape({new_token_num, 1, vocabSize})); // TODO support beamsearch
-    logits = ITensor::view(runtimeBuffers->logits, ITensor::makeShape({new_token_num, vocabSize}));
+    logits_ptr_in_use = ITensor::view(runtimeBuffers->logits, ITensor::makeShape({new_token_num, vocabSize}));
 }
 
 void MKBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
@@ -135,7 +138,7 @@ void MKBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMa
     inputBuffers.clear();
     outputBuffers.clear();
 
-    outputBuffers.insert_or_assign("logits", ITensor::view(logits));
+    outputBuffers.insert_or_assign("logits", ITensor::view(logits_ptr_in_use));
 
     inputBuffers.insert_or_assign("input_ids", inputIds);
     inputBuffers.insert_or_assign("k_cache", k_cache);

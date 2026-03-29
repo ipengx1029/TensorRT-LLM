@@ -64,8 +64,8 @@ public:
     TensorPtr k_cache;
     TensorPtr v_cache;
 
-    TensorPtr logits; 
-    TensorPtr bs_params;
+    TensorPtr logits_ptr_in_use;
+    TensorPtr logits_from_mk_buffer;
     TensorPtr input_lengths;
 
     SizeType32 seq_len_{0};
