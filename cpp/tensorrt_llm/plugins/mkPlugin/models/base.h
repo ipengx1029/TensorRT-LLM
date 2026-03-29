@@ -27,7 +27,7 @@ struct MKGlobals {
     MKTensor lm_head_weights;
 
     // KV缓存
-    MKTensor* kv_caches;
+    std::vector<MKTensor> kv_caches;
 
     // Rope表
     MKTensor rope_cos;

@@ -42,7 +42,7 @@ MkPlugin::MkPlugin(int model_type, int quant_type, int numHeads, int vocabSize,
     mNumInputs = 0;
     mParams.pos_id = 0;
     mParams.tokens_num = 0;
-    mParams.kv_caches = (mk::MKTensor*)malloc(numHiddenLayers * sizeof(mk::MKTensor));
+    mParams.kv_caches.resize(numHiddenLayers);
     mNextPosId = 0;
 }
 

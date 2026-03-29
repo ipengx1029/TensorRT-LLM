@@ -80,14 +80,14 @@ public:
 class GptSession;
 class GptSessionStateManager {
 public:
-    void saveState(const std::string& name, const GptSession& session);
+    void saveState(const GptSession& session);
 
-    void loadState(GptSession& session, const std::string& name);
+    void loadState(GptSession& session, SizeType32 idx);
 
-    bool hasState(const std::string& name) const;
+    bool isDoubleEngine() const;
 
 private:
-    std::unordered_map<std::string, GptSessionState> m_states;
+    std::vector<GptSessionState> m_states;
 };
 
 class [[deprecated("Use the executor API instead.")]] GptSession
@@ -276,16 +276,15 @@ public:
 
     friend class GptSessionStateManager;
 
-    void saveState(const std::string& name) {
-        mStateManager.saveState(name, *this);
+    void saveState() {
+        mStateManager.saveState(*this);
     }
 
-    void loadState(const std::string& name) {
-        mStateManager.loadState(*this, name);
+    void loadState(SizeType32 idx) {
+        mStateManager.loadState(*this, idx);
     }
 
     void addEngine(const ModelConfig& modelConfig, const std::string& engineFile);
-    void buffersSwitch();
 
 private:
     [[nodiscard]] bool useCudaGraphs()

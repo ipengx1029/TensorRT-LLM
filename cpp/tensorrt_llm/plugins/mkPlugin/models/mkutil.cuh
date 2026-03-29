@@ -54,11 +54,11 @@ GL convert2gl(MKGLTensor &tensor) {
     return kittens::make_gl<GL>(data_ptr, arr[0], arr[1], arr[2], arr[3]);
 }
 template<kittens::ducks::gl::all GL, size_t N, bool only_cols = false>
-std::array<GL, N> convert2gl_array(MKTensor* tensor_array) {
+std::array<GL, N> convert2gl_array(std::vector<MKTensor>& tensor_array) {
     return convert2gl_array_impl<GL, N, only_cols>(std::make_index_sequence<N>{}, tensor_array);
 }
 template<kittens::ducks::gl::all GL, size_t N, bool only_cols, size_t... I>
-std::array<GL, N> convert2gl_array_impl(std::index_sequence<I...>, MKTensor* tensor_array) {
+std::array<GL, N> convert2gl_array_impl(std::index_sequence<I...>, std::vector<MKTensor>& tensor_array) {
     return std::array<GL, N>{convert2gl<GL, only_cols>(tensor_array[I])...};
 }
 };

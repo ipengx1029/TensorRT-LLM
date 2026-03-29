@@ -37,117 +37,6 @@ namespace tensorrt_llm::runtime
 {
 class TllmRuntime;
 
-template <typename T>
-class MemoryOptional {
-private:
-    std::optional<T> current;
-    std::optional<T> memory;
-
-public:
-    MemoryOptional() = default;
-    MemoryOptional(const MemoryOptional& other)
-        : current(other.current), memory(other.memory) {
-    }
-
-    void set(const T& value) {
-        if (current) memory = std::move(current);
-        current = value;
-    }
-
-    void tempClear() {
-        if (current) {
-            memory = std::move(current);
-            current.reset();
-        }
-    }
-
-    bool restore() {
-        if (memory) {
-            current = std::move(memory);
-            memory.reset();
-            return true;
-        }
-        return false;
-    }
-
-    template<typename... Args>
-    T& emplace(Args&&... args) {
-        if (current.has_value()) {
-            memory = std::move(current);
-        }
-
-        current.emplace(std::forward<Args>(args)...);
-        return *current;
-    }
-
-    // explicit operator bool() const { return current.has_value(); }
-    explicit operator bool() const { return current.has_value() || memory.has_value(); }
-    T& operator*() {
-        if (current) {
-            return *current;
-        } else if (memory) {
-            return *memory;
-        }
-        throw std::bad_optional_access();
-    }
-    const T& operator*() const {
-        if (current) {
-            return *current;
-        } else if (memory) {
-            return *memory;
-        }
-        throw std::bad_optional_access();
-    }
-    T* operator->() {
-        if (current) {
-            return &*current;
-        } else if (memory) {
-            return &*memory;
-        }
-        throw std::bad_optional_access();
-    }
-    const T* operator->() const {
-        if (current) {
-            return &*current;
-        } else if (memory) {
-            return &*memory;
-        }
-        throw std::bad_optional_access();
-    }
-    MemoryOptional& operator=(const MemoryOptional& other) {
-        if (this != &other) {
-            current = other.current;
-            memory = other.memory;
-        }
-        return *this;
-    }
-    MemoryOptional& operator=(const T& value) {
-        if (current.has_value()) {
-            memory = std::move(current);
-        }
-        current = value;
-        return *this;
-    }
-    MemoryOptional& operator=(T&& value) {
-        if (current.has_value()) {
-            memory = std::move(current);
-        }
-        current = std::move(value);
-        return *this;
-    }
-    MemoryOptional& operator=(std::nullopt_t) {
-        if (current.has_value()) {
-            memory = std::move(current);
-        }
-        current = std::nullopt;
-        return *this;
-    }
-
-    bool hasMemory() const { return memory.has_value(); }
-    bool hasCurrent() const { return current.has_value(); }
-    void forgetMemory() { memory.reset(); }
-};
-
 class RuntimeBuffers
 {
 protected:
@@ -206,10 +95,11 @@ public:
     TensorPtr hiddenStates;
 
     // Transformer model buffer
-    MemoryOptional<TransformerBuffers> transformerBuffers;
+    std::optional<TransformerBuffers> transformerBuffers;
 
     // MegaKernel modle buffer
-    MemoryOptional<MKBuffers> mkBuffers;
+    std::optional<MKBuffers> mkBuffers;
+    bool isDoubleEngine{false};
 
     // Prompt tuning
     PromptTuningParams promptTuningParams;
@@ -246,8 +136,7 @@ public:
     void clear();
     void clearTensorMaps();
 
-    void addEngine(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
-    void switchBuffers();
+    void createMKBuffer(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
     void create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, 
                 TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig, 
                 std::optional<runtime::MedusaModule::MedusaChoices> const& medusaChoices);

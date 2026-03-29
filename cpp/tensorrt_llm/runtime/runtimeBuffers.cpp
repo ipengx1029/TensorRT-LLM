@@ -67,25 +67,11 @@ void RuntimeBuffers::clearTensorMaps()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::addEngine(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
+void RuntimeBuffers::createMKBuffer(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
+    isDoubleEngine = true;
     bool megaKernelModel = modelConfig.isMegaKernelModel();
     if (megaKernelModel) {
         mkBuffers.emplace(runtime, modelConfig, worldConfig, transformerBuffers->presentKeysVals);
-        mkBuffers.tempClear();
-    }
-}
-
-void RuntimeBuffers::switchBuffers() {
-    if (mkBuffers.hasCurrent()) {
-        mkBuffers.tempClear();
-        transformerBuffers.restore();
-        TLLM_LOG_TRACE("switchBuffers: from mkBuffers to transformerBuffers");
-    } else if (transformerBuffers.hasCurrent()) {
-        transformerBuffers.tempClear();
-        mkBuffers.restore();
-        TLLM_LOG_TRACE("switchBuffers: from transformerBuffers to mkBuffers");
-    } else {
-        TLLM_THROW("No buffers to switch");
     }
 }
 
@@ -419,7 +405,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
     auto const batchSize = generationConfig.batchSize;
     auto const beamWidth = generationConfig.beamWidth;
     auto const maxDecoderLen = modelConfig.getMaxTokensPerStep();
-    if (transformerBuffers.hasCurrent())
+    if (transformerBuffers)
     {
         transformerBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
     }
@@ -428,7 +414,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
         rnnStateBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
     }
 
-    if (mkBuffers.hasCurrent())
+    if (mkBuffers && !isDoubleEngine)
     {
         mkBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
     }
@@ -525,12 +511,12 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType32 const step,
             return ITensor::makeShape({batchSize * beamWidth, maxDecoderLen});
         }
     }();
-    if (transformerBuffers.hasCurrent()) {
+    if (transformerBuffers && !isDoubleEngine) {
         transformerBuffers->prepareNextStep(
             this, step, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
     }
 
-    if (mkBuffers.hasCurrent()) {
+    if (mkBuffers) {
         mkBuffers->prepareNextStep(
             this, step, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
     }
@@ -575,13 +561,14 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     inputBuffers.clear();
     outputBuffers.clear();
+    bool is_encode = (step == 0);
 
-    if (transformerBuffers.hasCurrent())
+    if (transformerBuffers && (!isDoubleEngine || is_encode))
     {
         transformerBuffers->getRuntimeBuffers(
             this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
     }
-    if (mkBuffers.hasCurrent())
+    if (mkBuffers && (!isDoubleEngine || !is_encode))
     {
         mkBuffers->getRuntimeBuffers(
             this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
