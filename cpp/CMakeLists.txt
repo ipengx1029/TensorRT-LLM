@@ -38,6 +38,8 @@ option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(USE_SHARED_NVRTC "Use shared NVRTC library instead of static" OFF)
+option(WITH_KITTENS_HOPPER, "with kittens hopper build" OFF)
+option(WITH_TIME_PROFILE, "with profile encoder decoder" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")

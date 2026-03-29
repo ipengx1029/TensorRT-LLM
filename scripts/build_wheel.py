@@ -55,7 +55,9 @@ def main(build_type: str = "Release",
          skip_building_wheel: bool = False,
          python_bindings: bool = True,
          benchmarks: bool = False,
-         nvtx: bool = False):
+         nvtx: bool = False,
+         mk_hopper: bool = False,
+         time_profile: bool = False):
     project_dir = Path(__file__).parent.resolve().parent
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
@@ -147,6 +149,11 @@ def main(build_type: str = "Release",
         cmake_def_args.append(
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
         )
+
+    if mk_hopper:
+        cmake_def_args.append(f"-DWITH_KITTENS_HOPPER=ON")
+    if time_profile:
+        cmake_def_args.append(f"-DWITH_TIME_PROFILE=ON")
 
     build_pyt = "OFF" if cpp_only else "ON"
     th_common_lib = "" if cpp_only else "th_common"

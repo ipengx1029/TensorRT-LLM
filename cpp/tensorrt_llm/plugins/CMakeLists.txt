@@ -73,6 +73,12 @@ list(APPEND PLUGIN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/api/tllmPlugin.cpp")
 if(WIN32)
   set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS 1)
 endif()
+if(WITH_KITTENS_HOPPER)
+  add_compile_definitions(KITTENS_HOPPER)
+else()
+  # add kittens disable tma
+  add_compile_definitions(KITTENS_DISABLE_TMA)
+endif()
 
 add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
 

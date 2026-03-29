@@ -42,6 +42,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "time.h"
 
 namespace tensorrt_llm::batch_manager
 {

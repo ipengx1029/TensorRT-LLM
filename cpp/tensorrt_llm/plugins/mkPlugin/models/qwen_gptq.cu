@@ -1,3 +1,4 @@
+#ifndef KITTENS_HOPPER
 #include "base.h"
 #include "qwen.h"
 #include "mkutil.cuh"
@@ -93,7 +94,11 @@ TGlobal GPTQQwenModelInfer<sms_count, max_share_memory>::make_global_configs(MKG
         convert2gl<bs_param_layout>(globals.bs_params)
     );
 }
-template class GPTQQwenModelInfer<56, 164000>;
-// template class GPTQQwenModelInfer<72, 100000>;
-// template class GPTQQwenModelInfer<92, 100000>;
+
+template class GPTQQwenModelInfer<56,  164000>; // A30
+template class GPTQQwenModelInfer<72,  100000>; // A10
+template class GPTQQwenModelInfer<92,  100000>; // L20 
+template class GPTQQwenModelInfer<108, 164000>; // A100
+template class GPTQQwenModelInfer<128,  100000>; //4090
 }
+#endif

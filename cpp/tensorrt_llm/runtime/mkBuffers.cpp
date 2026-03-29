@@ -16,6 +16,7 @@ MKBuffers::MKBuffers() {
     logits_ptr_in_use = nullptr;
     bs_params = nullptr;
     input_lengths = nullptr;
+    bs_host_params = nullptr;
 }
 
 MKBuffers::MKBuffers(TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) {
@@ -29,6 +30,7 @@ MKBuffers::MKBuffers(TllmRuntime const& runtime, runtime::ModelConfig const& mod
     logits_ptr_in_use = logits_from_mk_buffer;
     bs_params = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     input_lengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
+    bs_host_params = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
 }
 
 void MKBuffers::reshape(GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
@@ -66,6 +68,7 @@ void MKBuffers::reshape(GenerationConfig const& generationConfig, ModelConfig co
     logits_from_mk_buffer->reshape(ITensor::makeShape({inputLengthSum, vocabSize}));
     logits_ptr_in_use = logits_from_mk_buffer;
     bs_params->reshape(ITensor::makeShape({batchSize, 3}));
+    bs_host_params->reshape(ITensor::makeShape({batchSize, 3}));
     input_lengths->reshape(ITensor::makeShape({batchSize}));
 }
 
@@ -149,8 +152,7 @@ void MKBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMa
 
 int MKBuffers::make_bs_param(BufferManager& manager, ITensor &input_lengths_host) {
     const int batch_size = generation_config_.batchSize;
-    std::vector<int> bs_params_host;
-    bs_params_host.resize(3*batch_size);
+    int* bs_params_host = bufferCast<int>(*bs_host_params);
     int offset = 0;
     int idx = 0;
     auto input_lengths_buffer = BufferRange<SizeType32>(input_lengths_host);
@@ -163,15 +165,14 @@ int MKBuffers::make_bs_param(BufferManager& manager, ITensor &input_lengths_host
         input_lengths_ptr[i] = len;
         offset += len;
     }
-    bs_params = manager.copyFrom(
-        bs_params_host.data(), ITensor::makeShape({batch_size, 3}), nvinfer1::DataType::kINT32, MemoryType::kGPU);
+    bs_params->reshape(ITensor::makeShape({batch_size, 3}));
+    manager.copy(bs_params_host, *bs_params, MemoryType::kGPU);
     return offset;
 }
 
 int MKBuffers::update_bs_param(BufferManager& manager, ITensor &input_lengths_host, SizeType32 new_token_num) {
     const int batch_size = generation_config_.batchSize;
-    std::vector<int> bs_params_host;
-    bs_params_host.resize(3*batch_size);
+    int* bs_params_host = bufferCast<int>(*bs_host_params);
     int idx = 0;
     auto input_lengths_buffer = BufferRange<SizeType32>(input_lengths_host);
     for (int i = 0; i < batch_size; ++i) {
@@ -180,7 +181,7 @@ int MKBuffers::update_bs_param(BufferManager& manager, ITensor &input_lengths_ho
         bs_params_host[idx++] = 1;
         bs_params_host[idx++] = len + new_token_num;
     }
-    bs_params = manager.copyFrom(
-        bs_params_host.data(), ITensor::makeShape({batch_size, 3}), nvinfer1::DataType::kINT32, MemoryType::kGPU);
+    bs_params->reshape(ITensor::makeShape({batch_size, 3}));
+    manager.copy(bs_params_host, *bs_params, MemoryType::kGPU);
     return batch_size;
 }

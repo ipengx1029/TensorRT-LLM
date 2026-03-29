@@ -85,7 +85,13 @@ TGlobal QwenModelInfer<sms_count, max_share_memory>::make_global_configs(MKGloba
         convert2gl<bs_param_layout>(globals.bs_params)
     );
 }
+#ifndef KITTENS_HOPPER
 template class QwenModelInfer<56, 164000>;
 template class QwenModelInfer<72, 100000>;
 template class QwenModelInfer<92, 100000>;
+template class QwenModelInfer<108, 164000>; // a100
+template class QwenModelInfer<128, 100000>; // 4090
+#else
+template class QwenModelInfer<132, 227000>;
+#endif
 }

@@ -70,5 +70,8 @@ public:
 
     SizeType32 seq_len_{0};
     GenerationConfig generation_config_;
+
+        // host params 
+    TensorPtr bs_host_params;
 };
 } // namespace tensorrt_llm::runtime
