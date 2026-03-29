@@ -1,24 +1,39 @@
 import argparse
 import os
+import sys
+sys.path.append(".")
 import tensorrt as trt
 import torch
 from tensorrt_llm.runtime import Session, TensorInfo
 from tensorrt_llm._utils import torch_dtype_to_trt
 from transformers import AutoTokenizer
+from reader import FileIterableDataset
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--engine_dir', type=str, default='./mk_engine')
     parser.add_argument('--tokenizer_dir', type=str, default='./Qwen3-1.7B')
     parser.add_argument('--engine_name', type=str, default='rank0.engine')
-    parser.add_argument('--max_new_tokens', type=int, default=100, help='Maximum number of new tokens to generate')
-    parser.add_argument('--prompt', type=str, default='讲一个长故事', help='Input prompt for generation')
+    parser.add_argument('--max_new_tokens', type=int, default=30, help='Maximum number of new tokens to generate')
     parser.add_argument('--batch_size', type=int, default=2, help='Use max batch size generation')
+    parser.add_argument('--max_input_length', type=int, default=160)
+    parser.add_argument('--no_add_special_tokens',
+                        dest='add_special_tokens',
+                        default=True,
+                        action='store_false',
+                        help="Whether or not to add special tokens")
+    parser.add_argument('--do_basic_tokenize', type=int, default=1, help='enable basic_tokenize.')
+    parser.add_argument('--drop_last', default=False, action='store_true', help="drop last examples.")
+    parser.add_argument('--input_id_format', type=int, default=2)
+    parser.add_argument('--prompt', type=str, default=["讲一个长故事"])
+    parser.add_argument('--input_file', type=str, 
+                        help='CSV or Numpy file containing tokenized input. Alternative to text input.',
+                        default=None)
     return parser.parse_args()
 
 class ModelRunner(object):
     """ model runner """
     def __init__(self, args):
-        self.max_batch_size = args.batch_size
+        self.max_batch_size = 2
         self.max_seq_len = 128
         self.num_hidden_layers = 28
         self.num_kv_heads = 8
@@ -95,6 +110,7 @@ class ModelRunner(object):
         else: # encoder
             self.make_bs_params(input_lengths)
         bs_params = self.bs_params[:batch_size, :]
+        #print("bs_params=", bs_params)
         inputs = {
             "input_ids": input_ids,
             "input_lengths": input_lengths,
@@ -119,55 +135,75 @@ class ModelRunner(object):
         # print output
         # for k, v in outputs.items():
         #     print(f"{k}=", v.shape, v)
-        return outputs
+        logits = outputs['logits']
+        output_ids = torch.argmax(logits, dim=-1)
+        #print("output_ids=", output_ids)
+        return output_ids
 
+    def generate(self, input_ids, input_lengths, max_new_tokens):
+        """ generate """
+        batch_size = input_lengths.shape[0]
+        output_ids = self.run(input_ids, input_lengths)
+        output_tokens = torch.zeros(
+            batch_size, 
+            max_new_tokens, 
+            device=input_ids.device, 
+            dtype=torch.int32
+        )
+        offset = 0
+        for bs in range(batch_size):
+            offset += input_lengths[bs].item()    
+            output_tokens[bs][0] = output_ids[offset - 1]
+        #print("output_tokens=", output_tokens)
+
+        input_token_pos = 0
+        input_ids = input_ids[: batch_size]
+        for step in range(1, max_new_tokens):
+            for bs in range(batch_size):
+                input_ids[bs] = output_tokens[bs][input_token_pos]
+            input_lengths.fill_(1)
+            output_ids = self.run(input_ids, input_lengths)
+            output_tokens[:, input_token_pos + 1 : input_token_pos + 2] = output_ids.view(batch_size, -1)
+            input_token_pos = input_token_pos + 1
+        
+        return output_tokens
 
 def main():
     args = parse_arguments()
     print("args:", args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir)
-    input_ids_cpu = tokenizer(args.prompt, add_special_tokens=True)["input_ids"] 
 
-    input_ids = torch.tensor(input_ids_cpu * args.batch_size, dtype=torch.int32).to('cuda')
-    seq_lens = [len(input_ids_cpu)] * args.batch_size
-    input_lengths = torch.tensor(seq_lens, dtype=torch.int32)
-    print("input_ids=", input_ids, ", input_lengths=", input_lengths)
+    pad_id = tokenizer.pad_token_id
+    end_id = tokenizer.eos_token_id
+    print("use do_basic_tokenize:", args.do_basic_tokenize, ", pad_id: ", pad_id, ", end_id: ", end_id)
 
-    batch_size = input_lengths.shape[0]
     runner = ModelRunner(args)
-    outputs = runner.run(input_ids, input_lengths)
-    logits = outputs['logits']
-    output_ids = torch.argmax(logits, dim=-1)
-    #print("output_ids=", output_ids)
-    output_tokens = torch.zeros(
-        batch_size, 
-        args.max_new_tokens, 
-        device=input_ids.device, 
-        dtype=torch.int32
-    )
-    offset = 0
-    for bs in range(batch_size):
-        offset += input_lengths[bs].item()    
-        output_tokens[bs][0] = output_ids[offset - 1]
-    #print("output_tokens=", output_tokens)
-
-    input_token_pos = 0
-    input_ids = input_ids[: batch_size]
-    for step in range(1, args.max_new_tokens):
-        for bs in range(batch_size):
-            input_ids[bs] = output_tokens[bs][input_token_pos]
-        input_lengths.fill_(1)
-        outputs = runner.run(input_ids, input_lengths)
-        logits = outputs['logits']
-        output_ids = torch.argmax(logits, dim=-1)
-        #print("output_ids=", output_ids)
-        output_tokens[:, input_token_pos + 1 : input_token_pos + 2] = output_ids.view(batch_size, -1)
-        input_token_pos = input_token_pos + 1
-    ## output tokens
-    to_cpu = output_tokens.cpu()
-    print("Output ids: ", to_cpu)
-    print("Output text: ", tokenizer.batch_decode(to_cpu))
+    if args.input_file is None:
+        input_ids_cpu = tokenizer(args.prompt, add_special_tokens=True)["input_ids"] 
+        seq_lens = [len(input_ids_cpu)]
+        input_lengths = torch.tensor(seq_lens, dtype=torch.int32)
+        input_ids = torch.tensor(input_ids_cpu, dtype=torch.int32).to('cuda')
+        output_ids = runner.generate(input_ids, input_lengths, args.max_new_tokens)
+        to_cpu = output_ids.cpu()
+        print("Output ids: ", to_cpu)
+        print("Output text: ", tokenizer.batch_decode(to_cpu))
+    else:
+        dataset = FileIterableDataset(input_file=args.input_file,
+                                    tokenizer=tokenizer,
+                                    batch_size=args.batch_size,
+                                    drop_last=args.drop_last,
+                                    add_special_tokens=args.add_special_tokens,
+                                    max_input_length=args.max_input_length,
+                                    input_id_format=args.input_id_format,
+                                    sort_example=False)
+        for i, batch in enumerate(dataset):
+            #print("batch=", batch)
+            input_ids = torch.concat(batch["input_ids"]).to('cuda')
+            input_lengths = torch.tensor(batch["input_lengths"], dtype=torch.int32)
+            output_ids = runner.generate(input_ids, input_lengths, args.max_new_tokens)
+            to_cpu = output_ids.cpu()
+            print("i=", i, ", output text: ", tokenizer.batch_decode(to_cpu))
     
 if __name__ == '__main__':
     main()

@@ -36,7 +36,7 @@ from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
 from .linear import ColumnLinear, QKVColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
-from .normalization import LayerNorm
+from .normalization import LayerNorm, RmsNorm
 
 from ..functional import maximum  # isort:skip
 
@@ -425,8 +425,8 @@ class Attention(Module):
                                             dtype=dtype)
         self.qk_layernorm = qk_layernorm
         if self.qk_layernorm:
-            self.q_layernorm = LayerNorm(self.attention_head_size, dtype=dtype)
-            self.k_layernorm = LayerNorm(self.attention_head_size, dtype=dtype)
+            self.q_layernorm = RmsNorm(self.attention_head_size, dtype=dtype)
+            self.k_layernorm = RmsNorm(self.attention_head_size, dtype=dtype)
         self.inner_layernorm = LayerNorm(self.hidden_size, dtype=dtype,
                                          eps=eps) if inner_layernorm else None
         if clip_qkv is not None:

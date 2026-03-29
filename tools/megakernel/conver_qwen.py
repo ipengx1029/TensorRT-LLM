@@ -10,6 +10,8 @@ from tensorrt_llm.models import Qwen3MegaKernel
 from tensorrt_llm import Builder, Parameter
 from tensorrt_llm.network import net_guard
 from transformers import Qwen3Config
+from tensorrt_llm.builder import BuildConfig
+from tensorrt_llm.version import __version__
 import sys
 sys.path.append('../3rdparty/tk/megakernels')
 from megakernels.model_types import ExtraModelConfig
@@ -29,9 +31,10 @@ def get_engine_name(rank):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument('--max_batch_size', type=int, default=2)
-    parser.add_argument('--max_input_len', type=int, default=100)
-    parser.add_argument('--max_output_len', type=int, default=100)
+    parser.add_argument('--max_batch_size', type=int, default=8)
+    parser.add_argument('--max_input_len', type=int, default=160)
+    parser.add_argument('--max_output_len', type=int, default=80)
+    parser.add_argument('--max_beam_width', type=int, default=1)
     parser.add_argument('--output_dir', type=str, default='./mk_engine')
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--dtype', type=str, default='bfloat16', choices=['bfloat16'])
@@ -148,17 +151,26 @@ def main():
     print("type of model.dtype=", type(model.dtype))
     tensorrt_llm.logger.set_level("info")
     builder = Builder()
+    max_seq_len = args.max_input_len + args.max_output_len
     builder_config = builder.create_builder_config(  # 需要仔细研究
         precision=model.dtype,
         strongly_typed=True,
         int8=False,
         fp8=False,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        max_output_len=args.max_output_len,
+        max_beam_width=args.max_beam_width,
+        max_num_tokens=max_seq_len,
+        opt_num_tokens=max_seq_len // 2,
+        remove_input_padding=True,
     )
     print("init builder finished")
     network = builder.create_network()
     #network.plugin_config.debug_print = True
     network.plugin_config.remove_input_padding = True
     network.plugin_config.megakernel_model = True
+    network.plugin_config.paged_kv_cache = False
     network.plugin_config.set_lookup_plugin("bfloat16")
     with net_guard(network):
         # 在net_guard上下文中初始化Tensor
@@ -185,8 +197,49 @@ def main():
         f.write(engine)
     builder_config.engine_name = engine_name
     builder_config.precision = "bfloat16"
-    builder.save_config(builder_config,
-                        os.path.join(args.output_dir, 'config.json'))
+
+    dict_config = builder_config.to_dict()
+    build_config = BuildConfig.from_dict(
+        dict_config["builder_config"], 
+        plugin_config=builder_config.plugin_config)
+    hf_config = model.config
+    config = {
+        'version': __version__,
+        'pretrained_config': {
+            'architecture': 'Qwen3ForCausalLM',
+            'dtype': "bfloat16",
+            'logits_dtype': 'float32',
+            'num_hidden_layers': hf_config.num_hidden_layers,
+            'num_attention_heads': hf_config.num_attention_heads,
+            'num_key_value_heads': hf_config.num_key_value_heads,
+            'hidden_size': hf_config.hidden_size,
+            'intermediate_size': hf_config.intermediate_size,
+            'vocab_size': hf_config.vocab_size,
+            'head_dim': hf_config.head_dim,
+            'embedding_vocab_size': hf_config.vocab_size,
+            'max_position_embeddings': hf_config.max_position_embeddings,
+            'hidden_act': hf_config.hidden_act,
+            'initializer_range': hf_config.initializer_range,
+            'quantization': {
+                'quant_algo': None,
+                'kv_cache_quant_algo': None,
+                'exclude_modules': ['lm_head', 'nlu_head', 'context_feature_model']
+            },
+            'mapping': {
+                'world_size': 1,
+                'tp_size': 1,
+                'pp_size': 1,
+            },
+            'rms_norm_eps': hf_config.rms_norm_eps,
+            'rope_theta': hf_config.rope_theta,
+            'nlu_heads': getattr(hf_config, "nlu_heads", []),
+            'context_features_size': getattr(hf_config, "context_features_size", 0),
+        },
+        "build_config" : build_config.to_dict()
+    }
+    print("config=", config)
+    with open(os.path.join(args.output_dir, 'config.json'), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
     print(f"save model engine to {args.output_dir} success")
 
 
