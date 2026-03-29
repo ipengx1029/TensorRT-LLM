@@ -36,7 +36,7 @@ from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
-from qwen_mk.model import Qwen3MegaKernel
+from qwen_mk.model import Qwen3MegaKernel, Qwen2MegaKernel
 
 __all__ = [
     'BertModel',
@@ -108,4 +108,6 @@ MODEL_MAP = {
     'DbrxForCausalLM': DbrxForCausalLM,
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
+    'Qwen3MegaKernel' : Qwen3MegaKernel,
+    'Qwen2MegaKernel' : Qwen2MegaKernel
 }

@@ -4,13 +4,13 @@
 from collections import OrderedDict
 from pathlib import Path
 import tensorrt as trt
-from transformers import Qwen3Config
+from transformers import Qwen3Config, Qwen2Config
 from tensorrt_llm.functional import mk_plugin, MKGlobals, MKScalesParams, Tensor, debug_print, cast
 from tensorrt_llm.module import Module
 from ...layers import Embedding
 from ...parameter import Parameter
 
-class Qwen3MegaKernel(Module):
+class QwenBaseMegaKernel(Module):
     """ qwen model """
     def __init__(self, config: Qwen3Config, quant_type: str):
         """ init """
@@ -25,11 +25,12 @@ class Qwen3MegaKernel(Module):
         self.dtype = config.torch_dtype
         self.num_hidden_layers = config.num_hidden_layers
         self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
+        self.head_dim = getattr(config, 'head_dim', self.hidden_size // self.num_attention_heads)
         self.intermediate_size = config.intermediate_size
         self.vocab_size = config.vocab_size
         self.max_position_embeddings = config.max_position_embeddings
         self._init_weights()
+        self.model_type = 1 if isinstance(config, Qwen3Config) else 2
 
     def _init_weights(self):
         """init weights"""
@@ -38,12 +39,12 @@ class Qwen3MegaKernel(Module):
             num_elem_weight = 4
         else:
             num_elem_weight = 1
-        qkv_hidden = (self.hidden_size // self.num_attention_heads) * (
+        self.qkv_hidden = (self.hidden_size // self.num_attention_heads) * (
             self.num_attention_heads + self.num_key_value_heads * 2
         )
         self.qkv_proj_weights = Parameter(
             shape=[self.num_hidden_layers, 
-                   qkv_hidden, 
+                   self.qkv_hidden, 
                    self.hidden_size // num_elem_weight],
             dtype=trt.bfloat16,
         )
@@ -95,14 +96,7 @@ class Qwen3MegaKernel(Module):
         self.rope_sin = Parameter(
             shape=[self.max_position_embeddings, self.head_dim], dtype=trt.bfloat16
         )
-        self.q_norm_weights = Parameter(
-            shape=[self.num_hidden_layers, self.head_dim],
-            dtype=trt.bfloat16,
-        )
-        self.k_norm_weights = Parameter(
-            shape=[self.num_hidden_layers, self.head_dim],
-            dtype=trt.bfloat16,
-        )
+        
         # [56, 129, 32]
         self.instructions = None
         # [28, 10, 32]
@@ -110,38 +104,61 @@ class Qwen3MegaKernel(Module):
         # [56, 129, 128]
         self.timings = None
 
+        def calculate_final_dimension_optimized(last_dim, alignment):
+            """
+            Calculate the final dimension of the tensor after padding to align with the given alignment.
+            """
+            hidden_group_cnt = self.hidden_size // 128
+            group_cnt = (last_dim + hidden_group_cnt - 1) // hidden_group_cnt
+            last_group_size = last_dim - (group_cnt - 1) * hidden_group_cnt
+            remainder = hidden_group_cnt % alignment
+            if remainder != 0:
+                padded_group_size = hidden_group_cnt + (alignment - remainder)
+            else:
+                padded_group_size = hidden_group_cnt
+
+            remainder_last = last_group_size % alignment
+            if remainder_last != 0:
+                padded_last_group_size = last_group_size + (alignment - remainder_last)
+            else:
+                padded_last_group_size = last_group_size
+
+            final_dim = (group_cnt - 1) * padded_group_size + padded_last_group_size
+            return final_dim
+
         if self.quant_type == "int4_sync_g128":
             group_size = 128
+            group_dim_aligned = calculate_final_dimension_optimized(self.hidden_size // group_size, 16)
             self.qkv_proj_scales = Parameter(
                 shape=[self.num_hidden_layers, 
-                       qkv_hidden, 
-                       self.hidden_size // group_size],
+                       self.qkv_hidden, 
+                       group_dim_aligned],
                 dtype=trt.bfloat16,
             ) #torch.Size([28, 4096, 16]) torch.bfloat16
             self.o_proj_scales = Parameter(
                 shape=[self.num_hidden_layers, 
                        self.hidden_size, 
-                       self.hidden_size // group_size],
+                       group_dim_aligned],
                 dtype=trt.bfloat16,
             ) #torch.Size([28, 2048, 16]) torch.bfloat16
             self.up_proj_scales = Parameter(
                 shape=[
                     self.num_hidden_layers,
                     self.intermediate_size,
-                    self.hidden_size // group_size,
+                    group_dim_aligned,
                 ], 
                 dtype=trt.bfloat16,
             ) #torch.Size([28, 6144, 16]) torch.bfloat16
             self.gate_proj_scales = Parameter(
                 shape=[self.num_hidden_layers, 
                        self.intermediate_size, 
-                       self.hidden_size // group_size],
+                       group_dim_aligned],
                 dtype=trt.bfloat16,
             ) #torch.Size([28, 6144, 16]) torch.bfloat16
             self.down_proj_scales = Parameter(
                 shape=[self.num_hidden_layers, 
                        self.hidden_size, 
-                       self.intermediate_size // group_size],
+                       calculate_final_dimension_optimized(self.intermediate_size // group_size, 16)],
                 dtype=trt.bfloat16,
             ) ## torch.Size([28, 2048, 48]) torch.bfloat16
 
@@ -209,6 +226,7 @@ class Qwen3MegaKernel(Module):
             # input_lengths
             input_lengths,
             self.qkv_proj_weights.value,
+            None, #qkv bias
             self.attn_ln_weights.value,
             self.o_proj_weights.value,
             self.mlp_ln_weights.value,
@@ -221,8 +239,8 @@ class Qwen3MegaKernel(Module):
             self.rope_cos.value,
             self.rope_sin.value,
             # qk norm weights
-            self.q_norm_weights.value,
-            self.k_norm_weights.value,
+            None, #self.q_norm_weights.value
+            None, #self.k_norm_weights.value
             # instructions
             self.instructions.value,
             self.timings.value,
@@ -253,7 +271,7 @@ class Qwen3MegaKernel(Module):
         #hidden_states.mark_output("hidden_states", hidden_states.dtype)
         globals = self.init_globals(hidden_states, input_lengths, **kwargs)
         output = mk_plugin(
-            1,  # qwen model
+            self.model_type,  # qwen model
             globals,
             self.num_attention_heads,
             self.vocab_size,
@@ -267,3 +285,44 @@ class Qwen3MegaKernel(Module):
         logits.mark_output("logits", trt.float32)
         print("logits=", logits)
         return logits
+
+class Qwen3MegaKernel(QwenBaseMegaKernel):
+    """ Qwen3MegaKernel """
+    def __init__(self, config: Qwen3Config, quant_type: str):
+        super().__init__(config, quant_type)
+
+    def _init_weights(self):
+        super()._init_weights()
+        self.q_norm_weights = Parameter(
+            shape=[self.num_hidden_layers, self.head_dim],
+            dtype=trt.bfloat16,
+        )
+        self.k_norm_weights = Parameter(
+            shape=[self.num_hidden_layers, self.head_dim],
+            dtype=trt.bfloat16,
+        )
+
+    def init_globals(self, hidden_states, input_lengths, **kwargs):
+        """init globals"""
+        globs = super().init_globals(hidden_states, input_lengths, **kwargs)
+        globs.q_norm_weights = self.q_norm_weights
+        globs.k_norm_weights = self.k_norm_weights
+        return globs
+
+class Qwen2MegaKernel(QwenBaseMegaKernel):
+    """ Qwen2MegaKernel """
+    def __init__(self, config: Qwen2Config, quant_type: str):
+        super().__init__(config, quant_type)
+
+    def _init_weights(self):
+        super()._init_weights()
+        self.qkv_proj_bias = Parameter(
+            shape=[self.num_hidden_layers, self.qkv_hidden, 1],
+            dtype=trt.bfloat16,
+        )
+
+    def init_globals(self, hidden_states, input_lengths, **kwargs):
+        """init globals"""
+        globs = super().init_globals(hidden_states, input_lengths, **kwargs)
+        globs.qkv_proj_bias = self.qkv_proj_bias
+        return globs

@@ -6,16 +6,17 @@ import tensorrt_llm
 import torch
 import tensorrt as trt
 from tensorrt_llm._utils import  numpy_to_torch
-from tensorrt_llm.models import Qwen3MegaKernel
+from tensorrt_llm.models import Qwen3MegaKernel, Qwen2MegaKernel
 from tensorrt_llm import Builder, Parameter
 from tensorrt_llm.network import net_guard
-from transformers import Qwen3Config
+from transformers import Qwen3Config, Qwen2Config
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.version import __version__
 import sys
 sys.path.append('../3rdparty/tk/megakernels')
 from megakernels.model_types import ExtraModelConfig
 from megakernels.qwen3 import Qwen3ForCausalLM
+from megakernels.qwen2 import Qwen2ForCausalLM
 from megakernels.model_types import ExtraModelConfig
 from megakernels.scheduler import (
     assign_to_sms,
@@ -40,12 +41,19 @@ def parse_arguments():
     parser.add_argument('--dtype', type=str, default='bfloat16', choices=['bfloat16'])
     parser.add_argument('--qformat', type=str, default='bfloat16', 
                         choices=['bfloat16', 'int4_sync_g128'])
+    parser.add_argument('--qwen_version', type=str, default='qwen3', choices=['qwen2', 'qwen3'])
     return parser.parse_args()
 
-def load_weights_from_hf(model_dir, extra_config):
-    model = Qwen3ForCausalLM.from_pretrained(
-        model_dir, extra_config=extra_config
-    )
+def load_weights_from_hf(model_dir, extra_config, qwen_version):
+    # choose model from config
+    if qwen_version == 'qwen2':
+        model = Qwen2ForCausalLM.from_pretrained(
+            model_dir, extra_config=extra_config
+        )
+    elif qwen_version == 'qwen3':
+        model = Qwen3ForCausalLM.from_pretrained(
+            model_dir, extra_config=extra_config
+        )
     print("model loaded")
     schedule_builder = make_schedule_builder('latency')
     print("get schedule_builder")
@@ -74,9 +82,16 @@ def load_weights_from_hf(model_dir, extra_config):
         'instructions':schedule.globs.instructions,
         'timings':schedule.globs.timings,
         'embeddings': model.model.embed_tokens.embed_tokens.weight,
-        'q_norm_weights':schedule.globs.q_norm_weights,
-        'k_norm_weights':schedule.globs.k_norm_weights,
     }
+    if qwen_version == 'qwen3':
+        weights.update({
+            'q_norm_weights':schedule.globs.q_norm_weights,
+            'k_norm_weights':schedule.globs.k_norm_weights,
+        })
+    else:
+        weights.update({
+            'qkv_proj_bias':schedule.globs.qkv_proj_bias,
+        })
     # add quant scales if they exist
     if extra_config.qformat == "int4_sync_g128":
         weights["qkv_proj_scales"] = schedule.globs.qkv_proj_scales
@@ -100,12 +115,15 @@ def convert2model(model, weights, extra_config):
     model.lm_head_weights.value = weights['lm_head_weights'].to('cuda')
     model.rope_cos.value = weights['rope_cos'].to('cuda')
     model.rope_sin.value = weights['rope_sin'].to('cuda')
-    model.q_norm_weights.value = weights['q_norm_weights'].to('cuda')
-    model.k_norm_weights.value = weights['k_norm_weights'].to('cuda')
     model.barriers = Parameter(value=weights['barriers'].to('cuda'), shape=weights['barriers'].shape)
     model.instructions = Parameter(value=weights['instructions'].to('cuda'), shape=weights['instructions'].shape)
     model.timings = Parameter(value=weights['timings'].to('cuda'), shape=weights['timings'].shape)
     model.vocab_embedding.weight.value = weights['embeddings'].to('cuda')
+    if isinstance(model, Qwen2MegaKernel):
+        model.qkv_proj_bias.value = weights['qkv_proj_bias'].to('cuda')
+    if isinstance(model, Qwen3MegaKernel):
+        model.q_norm_weights.value = weights['q_norm_weights'].to('cuda')
+        model.k_norm_weights.value = weights['k_norm_weights'].to('cuda')
     if extra_config.qformat == "int4_sync_g128":
         print("load quant weight params")
         model.qkv_proj_scales.value = weights["qkv_proj_scales"].to('cuda')
@@ -128,7 +146,11 @@ def save_checkpoint(model, output_dir, save_config=True):
             json.dump(model.config.to_dict(), f, indent=4)
 
 def from_huggin_face(args):
-    config : Qwen3Config = Qwen3Config.from_pretrained(args.model_dir)
+    if args.qwen_version == 'qwen2':
+        config : Qwen2Config = Qwen2Config.from_pretrained(args.model_dir)
+        config.head_dim = config.hidden_size // config.num_attention_heads
+    elif args.qwen_version == 'qwen3':
+        config : Qwen3Config = Qwen3Config.from_pretrained(args.model_dir)
     max_seq_len = args.max_input_len + args.max_output_len 
     extra_config = ExtraModelConfig(
         interleave_rope=False,
@@ -136,8 +158,12 @@ def from_huggin_face(args):
         max_batch_size = args.max_batch_size,
         qformat=args.qformat
     )
-    model = Qwen3MegaKernel(config, args.qformat)
-    weights = load_weights_from_hf(args.model_dir, extra_config)
+    #TODO: choose model from config
+    if args.qwen_version == 'qwen2':
+        model = Qwen2MegaKernel(config, args.qformat)
+    elif args.qwen_version == 'qwen3':
+        model = Qwen3MegaKernel(config, args.qformat)
+    weights = load_weights_from_hf(args.model_dir, extra_config, args.qwen_version)
     convert2model(model, weights, extra_config)
     return model
 
