@@ -34,7 +34,7 @@ MkPlugin::MkPlugin(int model_type, int quant_type, int numHeads, int vocabSize,
       mNumHiddenLayers(numHiddenLayers), mNumKeyvalueHeads(numKeyvalueHeads),
       mHiddenSize(hiddenSize) {
     int sms_count = get_sms_count();
-    mModelInfer = mk::get_model_infer(model_type, quant_type, sms_count);
+    mModelInfer = mk_api::get_model_infer(model_type, quant_type, sms_count);
     TLLM_CHECK_WITH_INFO(mModelInfer != nullptr, 
         "MKPLugin get model infer nullptr error");
     TLLM_LOG_WARNING("initialize mkplugin sms_count=%d, model_type=%d, quant_type=%d", 
@@ -167,50 +167,56 @@ void MkPlugin::set_mk_gl_tensor(
     size_t byte_size = tensorrt_llm::runtime::BufferDataType(inputs[0].type).getSize();
     size_t temp_byte_size = token_nums * mHiddenSize * byte_size;
     // rms_norm_states [bs, hidden_dim]
-    mParams.rms_norm_states.dim.nbDims = 2;
-    mParams.rms_norm_states.dim.d[0] = token_nums;
-    mParams.rms_norm_states.dim.d[1] = mHiddenSize;
+    mParams.rms_norm_states.nbDims = 2;
+    mParams.rms_norm_states.d[0] = token_nums;
+    mParams.rms_norm_states.d[1] = mHiddenSize;
     mParams.rms_norm_states.ptr = (void *)ptr;
     ptr += temp_byte_size;
     // post_ln_rope_q [bs, hidden_dim]
-    mParams.q_post_rope.dim.nbDims = 2;
-    mParams.q_post_rope.dim.d[0] = token_nums;
-    mParams.q_post_rope.dim.d[1] = mHiddenSize;
+    mParams.q_post_rope.nbDims = 2;
+    mParams.q_post_rope.d[0] = token_nums;
+    mParams.q_post_rope.d[1] = mHiddenSize;
     mParams.q_post_rope.ptr = (void *)ptr;
     ptr += temp_byte_size;
     // attn_out [bs, hidden_dim]
-    mParams.attn_out.dim.nbDims = 2;
-    mParams.attn_out.dim.d[0] = token_nums;
-    mParams.attn_out.dim.d[1] = mHiddenSize;
+    mParams.attn_out.nbDims = 2;
+    mParams.attn_out.d[0] = token_nums;
+    mParams.attn_out.d[1] = mHiddenSize;
     mParams.attn_out.ptr = (void *)ptr;
     ptr += temp_byte_size;
     // silu_out [bs, inner_hidden_dim]
-    mParams.silu_out.dim.nbDims = 2;
-    mParams.silu_out.dim.d[0] = token_nums;
-    mParams.silu_out.dim.d[1] = mIntermediateSize;
+    mParams.silu_out.nbDims = 2;
+    mParams.silu_out.d[0] = token_nums;
+    mParams.silu_out.d[1] = mIntermediateSize;
     mParams.silu_out.ptr = (void *)ptr;
+}
+static inline void convert2mktensor(
+    mk_api::MKTensor &mk_tensor, void *ptr, const nvinfer1::Dims *dims) {
+    mk_tensor.ptr = ptr;
+    mk_tensor.nbDims = dims->nbDims;
+    mk_tensor.d = &dims->d[0];
 }
 // update gptq quant tensor
 void MkPlugin::update_gptq_gl_tensor(const int start_idx, 
     const nvinfer1::PluginTensorDesc *inputDesc, const void *const *inputs) {
     int offset = start_idx;
     // gptq scales weights
-    mParams.qkv_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    convert2mktensor(mParams.qkv_proj_scales, (void *)inputs[offset], &inputDesc[offset].dims);
     ++offset;
-    mParams.o_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    convert2mktensor(mParams.o_proj_scales, (void *)inputs[offset], &inputDesc[offset].dims);
     ++offset;
-    mParams.up_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    convert2mktensor(mParams.up_proj_scales, (void *)inputs[offset], &inputDesc[offset].dims);
     ++offset;
-    mParams.gate_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    convert2mktensor(mParams.gate_proj_scales, (void *)inputs[offset], &inputDesc[offset].dims);
     ++offset;
-    mParams.down_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    convert2mktensor(mParams.down_proj_scales, (void *)inputs[offset], &inputDesc[offset].dims);
 }
 int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
                       const PluginTensorDesc *outputDesc,
                       const void *const *inputs, void *const *outputs,
                       void *workspace, cudaStream_t stream) noexcept {
     // host buffer
-    int batch_size = inputDesc[1].dims.d[0] / 2;
+    int batch_size = inputDesc[1].dims.d[0] - 1;
     int *input_lengths = (int *)inputs[1];
     // pos id
     int tokens_num = 0;
@@ -232,50 +238,58 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
     // printf("batch size=%d, tokens_num=%d, pos_id=%d, input ptr=%lu\n",
     //     batch_size, tokens_num, mParams.pos_id, (uint64_t)inputs[0]);
 
-    mParams.hidden_states = {(void *)inputs[0], &inputDesc[0].dims};
-    mParams.instructions = {(void *)inputs[2], &inputDesc[2].dims};
-    mParams.timings = {(void *)inputs[3], &inputDesc[3].dims};
-    mParams.Bar = {(void *)inputs[4], &inputDesc[4].dims};
+    convert2mktensor(mParams.hidden_states, (void *)inputs[0], &inputDesc[0].dims);
+    convert2mktensor(mParams.instructions, (void *)inputs[2], &inputDesc[2].dims);
+    convert2mktensor(mParams.timings, (void *)inputs[3], &inputDesc[3].dims);
+    convert2mktensor(mParams.Bar, (void *)inputs[4], &inputDesc[4].dims);
     // reset barrier
-    mk::zero_mk_tensor<int>(mParams.Bar, stream);
+    mk_api::zero_mk_tensor<int>(mParams.Bar, stream);
 
     // 模型权重
-    mParams.qkv_weights = {(void *)inputs[5], &inputDesc[5].dims};
-    mParams.attn_norm_weights = {(void *)inputs[6], &inputDesc[6].dims};
-    mParams.o_weights = {(void *)inputs[7], &inputDesc[7].dims};
-    mParams.mlp_norm_weights = {(void *)inputs[8], &inputDesc[8].dims};
-    mParams.up_weights = {(void *)inputs[9], &inputDesc[9].dims};
-    mParams.gate_weights = {(void *)inputs[10], &inputDesc[10].dims};
-    mParams.down_weights = {(void *)inputs[11], &inputDesc[11].dims};
-    mParams.lm_head_norm_weights = {(void *)inputs[12], &inputDesc[12].dims};
-    mParams.lm_head_weights = {(void *)inputs[13], &inputDesc[13].dims};
+    convert2mktensor(mParams.qkv_weights, (void *)inputs[5], &inputDesc[5].dims);
+    convert2mktensor(mParams.attn_norm_weights, (void *)inputs[6], &inputDesc[6].dims);
+    convert2mktensor(mParams.o_weights, (void *)inputs[7], &inputDesc[7].dims);
+    convert2mktensor(mParams.mlp_norm_weights, (void *)inputs[8], &inputDesc[8].dims);
+    convert2mktensor(mParams.up_weights, (void *)inputs[9], &inputDesc[9].dims);
+    convert2mktensor(mParams.gate_weights, (void *)inputs[10], &inputDesc[10].dims);
+    convert2mktensor(mParams.down_weights, (void *)inputs[11], &inputDesc[11].dims);
+    convert2mktensor(mParams.lm_head_norm_weights, (void *)inputs[12], &inputDesc[12].dims);
+    convert2mktensor(mParams.lm_head_weights, (void *)inputs[13], &inputDesc[13].dims);
     // Rope表
-    mParams.rope_cos = {(void *)inputs[14], &inputDesc[14].dims};
-    mParams.rope_sin = {(void *)inputs[15], &inputDesc[15].dims};
+    convert2mktensor(mParams.rope_cos, (void *)inputs[14], &inputDesc[14].dims);
+    convert2mktensor(mParams.rope_sin, (void *)inputs[15], &inputDesc[15].dims);
 
     // KV缓存
     int idx = 16;
     for (int l = 0; l < mNumHiddenLayers; l++) {
-        mParams.kv_caches[l] = {(void *)inputs[idx + l], &inputDesc[idx + l].dims};
+        convert2mktensor(mParams.kv_caches[l], (void *)inputs[idx + l], &inputDesc[idx + l].dims);
     }
     idx += mNumHiddenLayers;
-    mParams.bs_params = {(void *)inputs[idx], &inputDesc[idx].dims}; idx++;
+    convert2mktensor(mParams.bs_params, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
 
     // Qwen qkv norm
     if (mModelType == 1) {
-        mParams.q_norm_weights = {(void *)inputs[idx], &inputDesc[idx].dims}; idx++;
-        mParams.k_norm_weights = {(void *)inputs[idx], &inputDesc[idx].dims}; idx++;
+        convert2mktensor(mParams.q_norm_weights, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
+        convert2mktensor(mParams.k_norm_weights, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
         if (mQuantType == 1) {
             TLLM_CHECK_WITH_INFO(mNumInputs == 24 + mNumHiddenLayers, "MKPLugin qwen quant model need 24 + numlayers inputs");
             update_gptq_gl_tensor(idx, inputDesc, inputs);
         } else {
             TLLM_CHECK_WITH_INFO(mNumInputs == 19 + mNumHiddenLayers, "MKPLugin qwen model need 19 + numlayers inputs");
         }
+    } else if (mModelType == 2) { // for qwen2
+        convert2mktensor(mParams.qkv_bias, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
+        if (mQuantType == 1) {
+            TLLM_CHECK_WITH_INFO(mNumInputs == 23 + mNumHiddenLayers, "MKPLugin qwen quant model need 23 + numlayers inputs");
+            update_gptq_gl_tensor(idx, inputDesc, inputs);
+        } else {
+            TLLM_CHECK_WITH_INFO(mNumInputs == 18 + mNumHiddenLayers, "MKPLugin qwen model need 18 + numlayers inputs");
+        }
     } else if (mQuantType == 1) {
         update_gptq_gl_tensor(idx, inputDesc, inputs);
     }
     // output
-    mParams.logits = {(void *)outputs[0], &outputDesc[0].dims};
+    convert2mktensor(mParams.logits, (void *)outputs[0], &outputDesc[0].dims);
     // model infer
     mModelInfer->infer(&mParams, stream);
 

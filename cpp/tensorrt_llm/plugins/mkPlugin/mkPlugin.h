@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include <string>
 #include <vector>
-#include "models/base.h"
+#include "mk_plugin_api.h"
 
 namespace tensorrt_llm {
 namespace plugins {
@@ -75,8 +75,8 @@ public:
     int mNumKeyvalueHeads;
     int mHiddenSize;
     std::string mNamespace;
-    std::shared_ptr<mk::ModelInfer> mModelInfer;
-    mk::MKGlobals mParams;
+    std::shared_ptr<mk_api::ModelInfer> mModelInfer;
+    mk_api::MKGlobals mParams;
     int mNumInputs;
     int mNextPosId;
 };

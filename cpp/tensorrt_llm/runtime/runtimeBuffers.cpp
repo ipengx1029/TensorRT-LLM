@@ -68,7 +68,6 @@ void RuntimeBuffers::clearTensorMaps()
 }
 
 void RuntimeBuffers::createMKBuffer(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
-    isDoubleEngine = true;
     bool megaKernelModel = modelConfig.isMegaKernelModel();
     if (megaKernelModel) {
         mkBuffers.emplace(runtime, modelConfig, worldConfig, transformerBuffers->presentKeysVals);
@@ -408,15 +407,12 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
     if (transformerBuffers)
     {
         transformerBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
+    } else if (mkBuffers) {
+        mkBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
     }
     if (rnnStateBuffers)
     {
         rnnStateBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
-    }
-
-    if (mkBuffers && !isDoubleEngine)
-    {
-        mkBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
     }
 
     // use output lengths after context step
@@ -464,17 +460,14 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     {
         transformerBuffers->prepareContextStep(
             this, inputIds, padId, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
+    } else if (mkBuffers) {
+        mkBuffers->prepareContextStep(
+            this, inputIds, padId, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
     }
 
     if (rnnStateBuffers)
     {
         rnnStateBuffers->prepareContextStep(this, manager);
-    }
-
-    if (mkBuffers) 
-    {
-        mkBuffers->prepareContextStep(
-            this, inputIds, padId, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
     }
 
     if (modelConfig.usePackedInput())
@@ -511,13 +504,12 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType32 const step,
             return ITensor::makeShape({batchSize * beamWidth, maxDecoderLen});
         }
     }();
-    if (transformerBuffers && !isDoubleEngine) {
-        transformerBuffers->prepareNextStep(
-            this, step, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
-    }
-
+    // mk decoder
     if (mkBuffers) {
         mkBuffers->prepareNextStep(
+            this, step, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
+    } else if (transformerBuffers) {
+        transformerBuffers->prepareNextStep(
             this, step, manager, kvCacheManager, firstBatchSlotIdx, modelConfig, worldConfig);
     }
     kernels::invokeFill(*lastTokenIds, 1, stream);
@@ -561,19 +553,25 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     inputBuffers.clear();
     outputBuffers.clear();
-    bool is_encode = (step == 0);
-
-    if (transformerBuffers && (!isDoubleEngine || is_encode))
-    {
-        transformerBuffers->getRuntimeBuffers(
-            this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
+    if (step == 0) {
+        // trt encoder
+        if (transformerBuffers) {
+            transformerBuffers->getRuntimeBuffers(
+                this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
+        } else if (mkBuffers) { 
+            mkBuffers->getRuntimeBuffers(
+                this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
+        }
+    } else {
+        // mk decoder
+        if (mkBuffers) {
+            mkBuffers->getRuntimeBuffers(
+                this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
+        } else if (transformerBuffers) {
+            transformerBuffers->getRuntimeBuffers(
+                this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
+        }
     }
-    if (mkBuffers && (!isDoubleEngine || !is_encode))
-    {
-        mkBuffers->getRuntimeBuffers(
-            this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
-    }
-
     if (rnnStateBuffers)
     {
         rnnStateBuffers->getRuntimeBuffers(this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);

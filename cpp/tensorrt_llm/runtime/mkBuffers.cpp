@@ -70,7 +70,7 @@ void MKBuffers::reshape(GenerationConfig const& generationConfig, ModelConfig co
     logits_ptr_in_use = logits_from_mk_buffer;
     bs_params->reshape(ITensor::makeShape({batchSize, 3}));
     bs_host_params->reshape(ITensor::makeShape({batchSize, 3}));
-    input_lengths->reshape(ITensor::makeShape({batchSize * 2}));
+    input_lengths->reshape(ITensor::makeShape({batchSize + 1}));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -103,7 +103,7 @@ MKBuffers MKBuffers::sliceTo(GenerationConfig const& generationConfig, ModelConf
 
     buffers.logits_ptr_in_use = ITensor::slice(logits_ptr_in_use, maxInputOffset, maxInputStep);
     buffers.bs_params = ITensor::slice(bs_params, offset, batchSize);
-    buffers.input_lengths = ITensor::slice(input_lengths, offset, batchSize * 2);
+    buffers.input_lengths = ITensor::slice(input_lengths, offset, batchSize + 1);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return buffers;
 }
@@ -132,13 +132,14 @@ void MKBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step,
     int new_token_num = 1;
     int* input_lengths_ptr = (int*)input_lengths->data();
     for (int i = 0; i < batchSize; ++i) {
-        if (step == 0) {
-            input_lengths_ptr[i + batchSize] = input_lengths_ptr[i];
-        } else {
-            input_lengths_ptr[i + batchSize] += input_lengths_ptr[i];
-        }
         input_lengths_ptr[i] = 1;
     }
+    if (seq_len_ == 0) {
+        // trt encoder + mk decoder
+        seq_len_ = BufferRange<SizeType32>(*(runtimeBuffers->contextLengthsHost))[0];
+    }
+    // add seq offset for next tokens
+    input_lengths_ptr[batchSize] = seq_len_;
 
     if (batchSize > 1) {
         new_token_num = update_bs_param(manager, *(runtimeBuffers->contextLengthsHost), step);
@@ -147,7 +148,7 @@ void MKBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step,
     seq_len_ += new_token_num;
     runtimeBuffers->logits->reshape(ITensor::makeShape({new_token_num, 1, vocabSize})); // TODO support beamsearch
     logits_ptr_in_use = ITensor::view(runtimeBuffers->logits, ITensor::makeShape({new_token_num, vocabSize}));
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop, step: %d, batch: %d, seq_len: %d", __PRETTY_FUNCTION__, step, batchSize, seq_len_);
 }
 
 void MKBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,

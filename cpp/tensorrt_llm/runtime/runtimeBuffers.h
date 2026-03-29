@@ -99,7 +99,6 @@ public:
 
     // MegaKernel modle buffer
     std::optional<MKBuffers> mkBuffers;
-    bool isDoubleEngine{false};
 
     // Prompt tuning
     PromptTuningParams promptTuningParams;
