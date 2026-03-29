@@ -24,8 +24,8 @@
 #include "tensorrt_llm/runtime/rnnStateBuffers.h"
 #include "tensorrt_llm/runtime/transformerBuffers.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/runtime/mkBuffers.h"
-
 #include <array>
 #include <vector>
 
@@ -33,17 +33,127 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 class KVCacheManager;
 }
-
 namespace tensorrt_llm::runtime
 {
 class TllmRuntime;
+
+template <typename T>
+class MemoryOptional {
+private:
+    std::optional<T> current;
+    std::optional<T> memory;
+
+public:
+    MemoryOptional() = default;
+    MemoryOptional(const MemoryOptional& other)
+        : current(other.current), memory(other.memory) {
+    }
+
+    void set(const T& value) {
+        if (current) memory = std::move(current);
+        current = value;
+    }
+
+    void tempClear() {
+        if (current) {
+            memory = std::move(current);
+            current.reset();
+        }
+    }
+
+    bool restore() {
+        if (memory) {
+            current = std::move(memory);
+            memory.reset();
+            return true;
+        }
+        return false;
+    }
+
+    template<typename... Args>
+    T& emplace(Args&&... args) {
+        if (current.has_value()) {
+            memory = std::move(current);
+        }
+
+        current.emplace(std::forward<Args>(args)...);
+        return *current;
+    }
+
+    // explicit operator bool() const { return current.has_value(); }
+    explicit operator bool() const { return current.has_value() || memory.has_value(); }
+    T& operator*() {
+        if (current) {
+            return *current;
+        } else if (memory) {
+            return *memory;
+        }
+        throw std::bad_optional_access();
+    }
+    const T& operator*() const {
+        if (current) {
+            return *current;
+        } else if (memory) {
+            return *memory;
+        }
+        throw std::bad_optional_access();
+    }
+    T* operator->() {
+        if (current) {
+            return &*current;
+        } else if (memory) {
+            return &*memory;
+        }
+        throw std::bad_optional_access();
+    }
+    const T* operator->() const {
+        if (current) {
+            return &*current;
+        } else if (memory) {
+            return &*memory;
+        }
+        throw std::bad_optional_access();
+    }
+    MemoryOptional& operator=(const MemoryOptional& other) {
+        if (this != &other) {
+            current = other.current;
+            memory = other.memory;
+        }
+        return *this;
+    }
+    MemoryOptional& operator=(const T& value) {
+        if (current.has_value()) {
+            memory = std::move(current);
+        }
+        current = value;
+        return *this;
+    }
+    MemoryOptional& operator=(T&& value) {
+        if (current.has_value()) {
+            memory = std::move(current);
+        }
+        current = std::move(value);
+        return *this;
+    }
+    MemoryOptional& operator=(std::nullopt_t) {
+        if (current.has_value()) {
+            memory = std::move(current);
+        }
+        current = std::nullopt;
+        return *this;
+    }
+
+    bool hasMemory() const { return memory.has_value(); }
+    bool hasCurrent() const { return current.has_value(); }
+    void forgetMemory() { memory.reset(); }
+};
 
 class RuntimeBuffers
 {
 protected:
     using TensorPtr = ITensor::SharedPtr;
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
-
+    using MedusaBuffers = tensorrt_llm::batch_manager::MedusaBuffers;
 public:
     using TensorMap = StringPtrMap<ITensor>;
 
@@ -85,14 +195,21 @@ public:
     TensorPtr cumLogProbs;
     TensorPtr logProbs;
 
+    // nlu scores
+    TensorPtr nluScores;
+
+    // context features
+    TensorPtr contextFeatures;
+    TensorPtr contextFeaturesPtr; // Record the initially created buffer address.
+
     // pipeline parallelism
     TensorPtr hiddenStates;
 
     // Transformer model buffer
-    std::optional<TransformerBuffers> transformerBuffers;
+    MemoryOptional<TransformerBuffers> transformerBuffers;
 
-    // MegaKernel model buffer
-    std::optional<MKBuffers> mkBuffers;
+    // MegaKernel modle buffer
+    MemoryOptional<MKBuffers> mkBuffers;
 
     // Prompt tuning
     PromptTuningParams promptTuningParams;
@@ -108,13 +225,32 @@ public:
     TensorPtr
         cacheGenerationFragmentPointerHost;   // host pointer array, used in merge generation logits fragments kernel
 
+    // Medusa
+    std::optional<MedusaBuffers> medusaBuffers;
+    // Medusa related
+    TensorPtr acceptedTokensLengthHost;        // [batchSize * beamWidth]
+     // Medusa
+    TensorPtr medusaInputTokens;
+    TensorPtr medusaSequenceLengths;
+    TensorPtr medusaContextLengths;
+
     bool allocated{false};
+    bool isMedusa{false};
+    // past key value pointers
+    std::vector<int8_t *> pastKeyValuePtrList;
+
+    // id of gEND token
+    SizeType32 endId{29983};
 
 public:
     void clear();
     void clearTensorMaps();
 
-    void create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void addEngine(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void switchBuffers();
+    void create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, 
+                TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig, 
+                std::optional<runtime::MedusaModule::MedusaChoices> const& medusaChoices);
 
     void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType32 beamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
@@ -135,13 +271,17 @@ public:
         KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
     TensorPtr prepareNextStep(SizeType32 step, BufferManager& manager, KvCacheManager* kvCacheManager,
-        SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+        SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool nlu_exec);
 
     void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType32 const step,
         TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
     void gatherLastTokenLogits(BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    // update medusa new tokens
+    void updateMedusaNewTokens(BufferManager& manager, 
+            TensorPtr const &accTokensLen, TensorPtr const &newTokens, TensorPtr const &nextDraftTokens);
+    void printAcceptedTokensLength(void);
 };
 
 } // namespace tensorrt_llm::runtime

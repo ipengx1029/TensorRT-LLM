@@ -72,6 +72,7 @@ def parse_arguments(args=None):
                         help='The sink token length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
+    parser.add_argument('--second_engine_dir', type=str, default=None)
     parser.add_argument('--use_py_session',
                         default=False,
                         action='store_true',
@@ -476,6 +477,8 @@ def main(args):
             end_id=end_id,
         )
     runner = runner_cls.from_dir(**runner_kwargs)
+    if args.second_engine_dir is not None:
+        runner.add_engine(args.second_engine_dir)
     
     if args.customize_position_id:
         from zeus.pos_id_manager import PosIdManager

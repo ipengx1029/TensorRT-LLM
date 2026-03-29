@@ -72,8 +72,7 @@ TGlobal GPTQQwenModelInfer<sms_count, max_share_memory>::make_global_configs(MKG
         convert2gl<norm_layout>(globals.lm_head_norm_weights), // torch::zeros({2048}, torch::kBFloat16)
         convert2gl<lm_head_weight_layout>(globals.lm_head_weights),   // torch::zeros({128256, 2048}, torch::kBFloat16)
         // kv cache
-        convert2gl<kvcache_layout>(globals.k_cache),
-        convert2gl<kvcache_layout>(globals.v_cache),
+        convert2gl_array<kvcache_layout, 28>(globals.kv_caches),
         // other buffers
         convert2gl<rope_layout>(globals.rope_cos),  // torch::zeros({131072, 64}, torch::kFloat32)
         convert2gl<rope_layout>(globals.rope_sin),  // torch::zeros({131072, 64}, torch::kFloat32)
@@ -94,7 +93,6 @@ TGlobal GPTQQwenModelInfer<sms_count, max_share_memory>::make_global_configs(MKG
         convert2gl<bs_param_layout>(globals.bs_params)
     );
 }
-
 template class GPTQQwenModelInfer<56,  164000>; // A30
 template class GPTQQwenModelInfer<72,  100000>; // A10
 template class GPTQQwenModelInfer<92,  100000>; // L20 

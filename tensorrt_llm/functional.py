@@ -5836,8 +5836,7 @@ class MKGlobals(object):
     timings: Tensor
     barriers: Tensor
     # kvcache
-    k_cache: Tensor
-    v_cache: Tensor
+    kv_caches: List[Tensor]
     # batch size
     bs_params: Tensor
     # scales params
@@ -5855,6 +5854,7 @@ def mk_plugin(
     hidden_size: int,
 ):
     """ mk plugin """
+    _num_hidden_layers = num_hidden_layers
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         "MKPlugin", "1", TRT_LLM_PLUGIN_NAMESPACE
     )
@@ -5893,6 +5893,7 @@ def mk_plugin(
         num_hidden_layers, num_keyvalue_heads, hidden_size])
     attn_plug = attn_plg_creator.create_plugin("mk_plugin", pfc)
 
+    kv_keys = [f"past_key_value_{i}" for i in range(_num_hidden_layers)]
     tensor_order = [
         # input
         "hidden_states", 
@@ -5912,9 +5913,7 @@ def mk_plugin(
         "lm_head_weights",
         "rope_cos", 
         "rope_sin",
-        # temp
-        "k_cache", 
-        "v_cache",  
+    ] + kv_keys + [
         "bs_params",
         # qkv norm weight
         "q_norm_weights",  #qwen
@@ -5926,14 +5925,15 @@ def mk_plugin(
         # llama not need qk norm
         if model_type == 0 and name in ["q_norm_weights", "k_norm_weights"]:
             continue
-        if not hasattr(globals, name):
-            print(f"name: {name} not found")
-            continue
         print(f"name: {name}")
         value = getattr(globals, name, None)
         if value is None:
-            print(f"name: {name} found is None skip it")
-            continue
+            if name.startswith("past_key_value_"):
+                _num = int(name.split('_')[-1])
+                value = globals.kv_caches[_num]
+            else:
+                print(f"name: {name} found is None skip it")
+                continue
         plug_inputs.append(value.trt_tensor)
         print(f"add tensor: {name} is {value}")
 

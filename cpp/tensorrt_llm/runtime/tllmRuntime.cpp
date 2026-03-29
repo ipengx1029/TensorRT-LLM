@@ -58,8 +58,8 @@ tensorrt_llm::runtime::TllmLogger defaultLogger{};
 } // namespace
 
 TllmRuntime::TllmRuntime(
-    void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger)
-    : mStream(std::make_shared<CudaStream>())
+    void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger, BufferManager::CudaStreamPtr stream /* = nullptr */)
+    : mStream(stream ? std::move(stream) : std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(logger)}
     , mEngine{mRuntime->deserializeCudaEngine(engineData, engineSize)}

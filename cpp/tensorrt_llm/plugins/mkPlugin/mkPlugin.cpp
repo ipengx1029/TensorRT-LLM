@@ -42,6 +42,7 @@ MkPlugin::MkPlugin(int model_type, int quant_type, int numHeads, int vocabSize,
     mNumInputs = 0;
     mParams.pos_id = 0;
     mParams.tokens_num = 0;
+    mParams.kv_caches = (mk::MKTensor*)malloc(numHiddenLayers * sizeof(mk::MKTensor));
     mNextPosId = 0;
 }
 
@@ -129,14 +130,15 @@ DimsExprs MkPlugin::getOutputDimensions(int outputIndex,
 }
 bool MkPlugin::supportsFormatCombination(int pos, const PluginTensorDesc *inOut,
                                          int nbInputs, int nbOutputs) noexcept {
-    if (pos == 1 || pos == 2 || pos == 3 || pos == 4 || pos == 18) {
+    if (pos == 1 || pos == 2 || pos == 3 || pos == 4 || pos == 16 + mNumHiddenLayers) {
         // input_lengths, barrier, instructs, timeing, params
         return (inOut[pos].format == TensorFormat::kLINEAR && 
             inOut[pos].type == nvinfer1::DataType::kINT32);
-    } else if (pos == 14 || pos == 15) { // rope_cos, rope_sin float32
-        return (inOut[pos].format == TensorFormat::kLINEAR &&
-            inOut[pos].type == nvinfer1::DataType::kFLOAT);
-    }
+    } 
+    // else if (pos == 14 || pos == 15) { // rope_cos, rope_sin float32
+    //     return (inOut[pos].format == TensorFormat::kLINEAR &&
+    //         inOut[pos].type == nvinfer1::DataType::kFLOAT);
+    // }
     return (inOut[pos].format == TensorFormat::kLINEAR && 
         inOut[pos].type == nvinfer1::DataType::kBF16);
 }
@@ -208,7 +210,7 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
                       const void *const *inputs, void *const *outputs,
                       void *workspace, cudaStream_t stream) noexcept {
     // host buffer
-    int batch_size = inputDesc[1].dims.d[0];
+    int batch_size = inputDesc[1].dims.d[0] / 2;
     int *input_lengths = (int *)inputs[1];
     // pos id
     int tokens_num = 0;
@@ -218,19 +220,17 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
     // auto add pos id
     if (tokens_num == batch_size) { // decoder
         mParams.encoder = false;
-        mParams.pos_id = mNextPosId;
-        mNextPosId += input_lengths[0];
+        mParams.pos_id = input_lengths[batch_size];
     } else { // encoder
         mParams.encoder = true;
         mParams.pos_id = 0;
-        mNextPosId = input_lengths[0];
     }
     mParams.batch_size = batch_size;
     mParams.tokens_num = tokens_num;
     // set mk gl temp buffer
     set_mk_gl_tensor(tokens_num, inputDesc, workspace);
-    // printf("batch size=%d, tokens_num=%d, next_pos_id=%d, input ptr=%lu\n", 
-    //     batch_size, tokens_num, mNextPosId, (uint64_t)inputs[0]);
+    // printf("batch size=%d, tokens_num=%d, pos_id=%d, input ptr=%lu\n",
+    //     batch_size, tokens_num, mParams.pos_id, (uint64_t)inputs[0]);
 
     mParams.hidden_states = {(void *)inputs[0], &inputDesc[0].dims};
     mParams.instructions = {(void *)inputs[2], &inputDesc[2].dims};
@@ -254,28 +254,32 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
     mParams.rope_sin = {(void *)inputs[15], &inputDesc[15].dims};
 
     // KV缓存
-    mParams.k_cache = {(void *)inputs[16], &inputDesc[16].dims};
-    mParams.v_cache = {(void *)inputs[17], &inputDesc[17].dims};
-    mParams.bs_params = {(void *)inputs[18], &inputDesc[18].dims};
+    int idx = 16;
+    for (int l = 0; l < mNumHiddenLayers; l++) {
+        mParams.kv_caches[l] = {(void *)inputs[idx + l], &inputDesc[idx + l].dims};
+    }
+    idx += mNumHiddenLayers;
+    mParams.bs_params = {(void *)inputs[idx], &inputDesc[idx].dims}; idx++;
 
     // Qwen qkv norm
     if (mModelType == 1) {
-        mParams.q_norm_weights = {(void *)inputs[19], &inputDesc[19].dims};
-        mParams.k_norm_weights = {(void *)inputs[20], &inputDesc[20].dims};
+        mParams.q_norm_weights = {(void *)inputs[idx], &inputDesc[idx].dims}; idx++;
+        mParams.k_norm_weights = {(void *)inputs[idx], &inputDesc[idx].dims}; idx++;
         if (mQuantType == 1) {
-            TLLM_CHECK_WITH_INFO(mNumInputs == 26, "MKPLugin qwen quant model need 26 inputs");
-            update_gptq_gl_tensor(21, inputDesc, inputs);
+            TLLM_CHECK_WITH_INFO(mNumInputs == 24 + mNumHiddenLayers, "MKPLugin qwen quant model need 24 + numlayers inputs");
+            update_gptq_gl_tensor(idx, inputDesc, inputs);
         } else {
-            TLLM_CHECK_WITH_INFO(mNumInputs == 21, "MKPLugin qwen model need 21 inputs");
+            TLLM_CHECK_WITH_INFO(mNumInputs == 19 + mNumHiddenLayers, "MKPLugin qwen model need 19 + numlayers inputs");
         }
     } else if (mQuantType == 1) {
-        update_gptq_gl_tensor(19, inputDesc, inputs);
+        update_gptq_gl_tensor(idx, inputDesc, inputs);
     }
     // output
     mParams.logits = {(void *)outputs[0], &outputDesc[0].dims};
     // model infer
     mModelInfer->infer(&mParams, stream);
 
+    // utils::debugPrint2File<__nv_bfloat16>("logits", outputDesc[0].dims, outputs[0], stream);
     return 0;
 }
 

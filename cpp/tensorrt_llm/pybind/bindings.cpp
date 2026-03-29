@@ -366,6 +366,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("model_config", &tr::GptSession::getModelConfig)
         .def_property_readonly("world_config", &tr::GptSession::getWorldConfig)
         .def_property_readonly("device", &tr::GptSession::getDevice)
+        .def("add_engine",
+            [](tr::GptSession& self, tr::ModelConfig const& modelConfig, std::string const& engineFile)
+            { self.addEngine(modelConfig, engineFile); },
+            py::arg("model_config"), py::arg("engine_file"))
         .def(
             "generate",
             [](tr::GptSession& self, tpr::GenerationOutput& outputs, tpr::GenerationInput const& inputs,

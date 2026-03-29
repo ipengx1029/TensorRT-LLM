@@ -131,7 +131,7 @@ def from_huggin_face(args):
     config : Qwen3Config = Qwen3Config.from_pretrained(args.model_dir)
     max_seq_len = args.max_input_len + args.max_output_len 
     extra_config = ExtraModelConfig(
-        interleave_rope=True,
+        interleave_rope=False,
         max_len_override = max_seq_len,
         max_batch_size = args.max_batch_size,
         qformat=args.qformat

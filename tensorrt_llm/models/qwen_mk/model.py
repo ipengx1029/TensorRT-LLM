@@ -90,10 +90,10 @@ class Qwen3MegaKernel(Module):
             dtype=trt.bfloat16,
         )
         self.rope_cos = Parameter(
-            shape=[self.max_position_embeddings, self.head_dim], dtype=trt.float32
+            shape=[self.max_position_embeddings, self.head_dim], dtype=trt.bfloat16
         )
         self.rope_sin = Parameter(
-            shape=[self.max_position_embeddings, self.head_dim], dtype=trt.float32
+            shape=[self.max_position_embeddings, self.head_dim], dtype=trt.bfloat16
         )
         self.q_norm_weights = Parameter(
             shape=[self.num_hidden_layers, self.head_dim],
@@ -149,6 +149,7 @@ class Qwen3MegaKernel(Module):
         """ prepare build inputs """
         # cache kv
         bs_range = [[1, (max_batch_size + 1) // 2, max_batch_size]]
+        bs_range_inputlens = [[1, (max_batch_size + 1) // 2, max_batch_size * 2]]
         max_seq_len = max_input_len + max_output_len
         bs_max_input_len = max_batch_size * max_input_len
         input_range = [[1, (bs_max_input_len + 1) // 2, bs_max_input_len]]
@@ -171,29 +172,24 @@ class Qwen3MegaKernel(Module):
             dtype=trt.int32,
             dim_range=OrderedDict(
                 [
-                    ("max_batch_size", bs_range),
+                    ("max_batch_size_inputlens", bs_range_inputlens),
                 ]
             ),
         )
-        bs_num_layers = self.num_hidden_layers * max_batch_size
         kv_dim_range = OrderedDict(
             [
-                ("nlayers_mbatchsize", [bs_num_layers]),
-                ("max_seq_len", seq_range),
+                ("max_batchsize", bs_range),
+                ("kv", [2]),
                 ("num_key_value_heads", [self.num_key_value_heads]),
+                ("max_seq_len", seq_range),
                 ("head_dim", [self.head_dim]),
             ]
         )
-        kv_shape = [bs_num_layers, -1, self.num_key_value_heads, self.head_dim]
-        model_kwargs["k_cache"] = Tensor(
-            name="k_cache",
-            shape=kv_shape,
-            dtype=trt.bfloat16,
-            dim_range=kv_dim_range,
-        )
-        model_kwargs["v_cache"] = Tensor(
-            name="v_cache", shape=kv_shape, dtype=trt.bfloat16, dim_range=kv_dim_range
-        )
+        kv_shape = [-1, 2, self.num_key_value_heads, -1, self.head_dim]
+        for i in range(self.num_hidden_layers):
+            model_kwargs[f"past_key_value_{i}"] = Tensor(
+                name=f"past_key_value_{i}", shape=kv_shape, dtype=trt.bfloat16, dim_range=kv_dim_range
+            )
         model_kwargs["bs_params"] = Tensor(
             name="bs_params",
             shape=[-1, 3],
@@ -232,8 +228,7 @@ class Qwen3MegaKernel(Module):
             self.timings.value,
             self.barriers.value,
             # kvcache
-            kwargs.get("k_cache"),
-            kwargs.get("v_cache"),
+            [kwargs.get(f"past_key_value_{i}") for i in range(self.num_hidden_layers)],
             # batch size
             kwargs.get("bs_params"),
             None

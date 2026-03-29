@@ -80,14 +80,49 @@ auto const kProfileMbIdxs = populateMicrobatchIndexes();
 
 } // namespace
 
+void GptSessionStateManager::saveState(const std::string& name, const GptSession& session) {
+    m_states.insert_or_assign(name, GptSessionState(session.mRuntime, session.mModelConfig));
+}
+
+void GptSessionStateManager::loadState(GptSession& session, const std::string& name) {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto it = m_states.find(name);
+    if (it != m_states.end()) {
+        auto& state = it->second;
+        session.mModelConfig = state.modelConfig;
+        session.mRuntime = state.runtime;
+        TLLM_LOG_TRACE("state name: %s", name.c_str());
+    } else {
+        TLLM_LOG_INFO("Failed to load state: " + name + " does not exist.");
+        loadState(session, "encode");
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+bool GptSessionStateManager::hasState(const std::string& name) const {
+    return m_states.find(name) != m_states.end();
+}
+
+void GptSession::addEngine(const ModelConfig& modelConfig, const std::string& engineFile) {
+    mModelConfig = modelConfig;
+    auto engine = utils::loadEngine(engineFile);
+    mRuntime = std::make_shared<TllmRuntime>(engine.data(), engine.size(), mSessionConfig.gpuWeightsPercent, *mLogger, mRuntime->getStreamPtr());
+    buffersAddEngine();
+    createContexts();
+    saveState("decode");
+    loadState("encode");
+}
+
 GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     void const* engineBuffer, std::size_t engineSize, LoggerPtr logger)
-    : mModelConfig{modelConfig}
+    : mSessionConfig{sessionConfig}
+    , mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
     , mDevice{utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(engineBuffer, engineSize, sessionConfig.gpuWeightsPercent, *mLogger)}
 {
+    saveState("encode");
     TLLM_LOG_WARNING(
         "GptSession is deprecated and will be removed in a future release."
         " Please use the executor API instead (cpp/include/tensorrt_llm/executor).");
@@ -181,6 +216,18 @@ void GptSession::createBuffers(SizeType32 numMicroBatches, Config const& session
             sessionConfig.medusaChoices);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptSession::buffersAddEngine() {
+    for (auto& buffer : mBuffers) {
+        buffer->addEngine(*mRuntime, mModelConfig, mWorldConfig);
+    }
+}
+
+void GptSession::buffersSwitch() {
+    for (auto& buffer : mBuffers) {
+        buffer->switchBuffers();
+    }
 }
 
 void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
@@ -746,6 +793,10 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
         generateBatched(microBatchesOutputs, microBatchesInputs, samplingConfig, onTokenGenerated, generationProfiler);
     }
 
+    if (mStateManager.hasState("decode")) {
+        loadState("encode");
+        buffersSwitch();
+    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -859,6 +910,10 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
     std::vector<bool> microBatchesFinished(numMicroBatches, false);
     SizeType32 numBatchesFinished{0};
     SizeType32 step{0};
+    if (mStateManager.hasState("decode")) {
+        loadState("decode");
+        buffersSwitch();
+    }
 
     if (generationProfiler)
     {

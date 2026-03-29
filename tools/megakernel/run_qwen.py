@@ -33,8 +33,8 @@ def parse_arguments():
 class ModelRunner(object):
     """ model runner """
     def __init__(self, args):
-        self.max_batch_size = 2
-        self.max_seq_len = 128
+        self.max_batch_size = 8
+        self.max_seq_len = args.max_input_length + args.max_new_tokens
         self.num_hidden_layers = 28
         self.num_kv_heads = 8
         self.head_dim = 128
@@ -73,9 +73,9 @@ class ModelRunner(object):
     def init_buffer(self):
         def make_buffer(shape, buffer_dtype=torch.bfloat16):
             return torch.zeros(shape, device="cuda", dtype=buffer_dtype)
-        nlayers_mbatchsize = self.num_hidden_layers * self.max_batch_size
-        self.k_cache = make_buffer([nlayers_mbatchsize, self.max_seq_len, self.num_kv_heads, self.head_dim])
-        self.v_cache = self.k_cache.clone()
+        kv_mbatchsize = 2 * self.max_batch_size
+        shape = [kv_mbatchsize, self.num_kv_heads, self.max_seq_len, self.head_dim]
+        self.kv_caches = [make_buffer(shape) for i in range(self.num_hidden_layers)]
         self.bs_params = torch.zeros([self.max_batch_size, 3], dtype=torch.int32, device="cuda")
 
     def infer_shape(self, inputs):
@@ -114,8 +114,9 @@ class ModelRunner(object):
         inputs = {
             "input_ids": input_ids,
             "input_lengths": input_lengths,
-            "k_cache": self.k_cache,
-            "v_cache": self.v_cache,
+            **{
+                f"past_key_value_{i}": self.kv_caches[i] for i in range(self.num_hidden_layers)
+            },
             "bs_params": bs_params,
         }
         outputs = self.infer_shape(inputs)
@@ -181,8 +182,10 @@ def main():
     runner = ModelRunner(args)
     if args.input_file is None:
         input_ids_cpu = tokenizer(args.prompt, add_special_tokens=True)["input_ids"] 
-        seq_lens = [len(input_ids_cpu)]
+        print(f"input ids {input_ids_cpu}")
+        seq_lens = [len(input_ids_cpu[0])]
         input_lengths = torch.tensor(seq_lens, dtype=torch.int32)
+        print(f"input len {input_lengths}")
         input_ids = torch.tensor(input_ids_cpu, dtype=torch.int32).to('cuda')
         output_ids = runner.generate(input_ids, input_lengths, args.max_new_tokens)
         to_cpu = output_ids.cpu()

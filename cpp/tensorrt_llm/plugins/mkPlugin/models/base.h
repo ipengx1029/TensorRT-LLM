@@ -27,8 +27,7 @@ struct MKGlobals {
     MKTensor lm_head_weights;
 
     // KV缓存
-    MKTensor k_cache;
-    MKTensor v_cache;
+    MKTensor* kv_caches;
 
     // Rope表
     MKTensor rope_cos;

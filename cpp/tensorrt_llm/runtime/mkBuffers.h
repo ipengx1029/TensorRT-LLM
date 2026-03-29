@@ -28,7 +28,13 @@ public:
     MKBuffers();
 
     MKBuffers(
+        TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, bool createKV);
+
+    MKBuffers(
         TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
+
+    MKBuffers(
+        TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, std::vector<TensorPtr>& pastKV);
     
     void reshape(
         GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
@@ -61,17 +67,18 @@ protected:
 public:
     // engine
     // TODO: use buffer from kvCacheManager 
+    std::vector<TensorPtr> presentKeysVals;
     TensorPtr k_cache;
     TensorPtr v_cache;
 
-    TensorPtr logits_ptr_in_use;
+    TensorPtr logits_ptr_in_use; 
     TensorPtr logits_from_mk_buffer;
+    TensorPtr bs_params;
     TensorPtr input_lengths;
 
     SizeType32 seq_len_{0};
     GenerationConfig generation_config_;
-
-        // host params 
+    // host params 
     TensorPtr bs_host_params;
 };
 } // namespace tensorrt_llm::runtime

@@ -33,7 +33,7 @@ public:
     using TensorMap = StringPtrMap<ITensor>;
 
     explicit TllmRuntime(
-        void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger);
+        void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger, BufferManager::CudaStreamPtr stream = nullptr);
 
     explicit TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer1::ILogger& logger)
         : TllmRuntime{engineData, engineSize, 1, logger}

@@ -42,8 +42,7 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include "time.h"
-
+#include "timer.h"
 namespace tensorrt_llm::batch_manager
 {
 class TrtGptModelV1;
@@ -68,13 +67,36 @@ class NcclCommunicator;
 class RuntimeBuffers;
 class TllmRuntime;
 
+class GptSessionState {
+public:
+    explicit GptSessionState(std::shared_ptr<TllmRuntime> runtime, const ModelConfig& config)
+        : modelConfig(config)
+        , runtime(std::move(runtime)) {}
+
+    ModelConfig modelConfig;
+    std::shared_ptr<TllmRuntime> runtime;
+};
+
+class GptSession;
+class GptSessionStateManager {
+public:
+    void saveState(const std::string& name, const GptSession& session);
+
+    void loadState(GptSession& session, const std::string& name);
+
+    bool hasState(const std::string& name) const;
+
+private:
+    std::unordered_map<std::string, GptSessionState> m_states;
+};
+
 class [[deprecated("Use the executor API instead.")]] GptSession
 {
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
     using KvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig;
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TokenGeneratedCallback = std::function<void(SizeType32 step, bool finished)>;
-
+    using MedusaChoices = runtime::MedusaModule::MedusaChoices;
 public:
     using LoggerPtr = std::shared_ptr<nvinfer1::ILogger>;
 
@@ -85,14 +107,18 @@ public:
     {
     public:
         Config(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
-            float gpuWeightsPercent = 1.0)
+            float gpuWeightsPercent = 1.0, 
+            std::optional<MedusaChoices> medusa_choices = std::nullopt)
             : maxBatchSize{maxBatchSize}
             , maxBeamWidth{maxBeamWidth}
             , maxSequenceLength{maxSequenceLength}
             , gpuWeightsPercent{gpuWeightsPercent}
+            , medusaChoices{medusa_choices}
         {
+            if (medusaChoices) {
+                decodingMode = std::make_optional<DecodingMode>(DecodingMode::Medusa());
+            }
         }
-
         // The maximum number of sequences in a batch
         SizeType32 maxBatchSize;
         // The maximum width of the beams in beam-search
@@ -115,6 +141,14 @@ public:
         std::optional<SizeType32> genMicroBatchSize = std::nullopt;
         std::optional<DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
+        std::optional<MedusaChoices> medusaChoices = std::nullopt;
+        std::optional<SizeType32> enableTrie = std::nullopt;
+        std::optional<SizeType32> endId = std::nullopt;
+        struct TrieConfig{
+           std::string path;
+           uint32_t enable_bizid = 0;
+        };
+        std::unordered_map<std::string, TrieConfig> trieMap;
     };
 
     //! @brief Optional profiler class to profile the generation phase of an inference request
@@ -240,6 +274,19 @@ public:
     //! @brief Print profile information per layer.
     [[nodiscard]] std::string getLayerProfileInfo() const;
 
+    friend class GptSessionStateManager;
+
+    void saveState(const std::string& name) {
+        mStateManager.saveState(name, *this);
+    }
+
+    void loadState(const std::string& name) {
+        mStateManager.loadState(*this, name);
+    }
+
+    void addEngine(const ModelConfig& modelConfig, const std::string& engineFile);
+    void buffersSwitch();
+
 private:
     [[nodiscard]] bool useCudaGraphs()
     {
@@ -251,9 +298,10 @@ private:
         TokenGeneratedCallback const& onTokenGenerated, std::shared_ptr<GenerationProfiler> const generationProfiler);
 
     void setup(Config const& sessionConfig);
+    void buffersAddEngine();
 
     void createContexts();
-    void createBuffers(SizeType32 numMicroBatches);
+    void createBuffers(SizeType32 numMicroBatches, Config const& sessionConfig);
     void createDecoders(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
         SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest,
         SizeType32 numMicroBatches, DecodingMode const& decodingMode);
@@ -263,15 +311,17 @@ private:
 
     void executeContextStep(std::vector<GenerationInput> const& generationBatchesInputs,
         std::vector<SizeType32> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
+
     SizeType32 executeGenerationStep(SizeType32 step, std::vector<GenerationInput> const& microBatchesInputs,
         std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType32> const& microBatchOffsets,
-        KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
+        KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished, bool nlu_exec = false);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
     void decoderStepAsync(SizeType32 decoderStep, SizeType32 microBatchId);
 
     //! @brief Synchronize with the decoder and return the `shouldStop` flag.
-    bool shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 microBatchId);
+    bool shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 microBatchId, 
+                        const SizeType32 step, const SizeType32 batchOffset);
 
     //! @brief Collect final output ids and log probs on last PP rank and send them to first PP rank.
     //! @details Receives are asynchronous on host, so synchronization is required before access.
@@ -284,6 +334,9 @@ private:
         SamplingConfig const& samplingConfig, SizeType32 microBatchId) const;
 
     TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
+    // update KV cache blocks for the next generation step
+    void updateKVCacheBlocks(const SizeType32 step, SizeType32 microBatchId);
+    void rewindKVCacheBlocks(const SizeType32 step, SizeType32 microBatchId, SizeType32 batchOffset);
 
     class CudaGraphExecutor
     {
@@ -308,7 +361,7 @@ private:
         }
 
         void clear();
-        void prepareNextGraph(TllmRuntime const& runtime, SizeType32 nextContextId);
+        void prepareNextGraph(TllmRuntime const& runtime, SizeType32 nextContextId, SizeType32 const &batchSize);
         void launch(CudaStream const& stream);
 
     private:
@@ -316,7 +369,8 @@ private:
         bool update(cudaGraph_t const& graph);
         void uploadToStream(CudaStream const& stream);
 
-        cudaGraphExec_t mInstance;
+        cudaGraphExec_t mInstance{nullptr};
+        SizeType32 mLastBatchSize{0};
     };
 
     class MicroBatchConfig
@@ -353,7 +407,10 @@ private:
     friend class batch_manager::TrtGptModelV1;
 
 private:
-    ModelConfig const mModelConfig;
+    GptSessionStateManager mStateManager;
+
+    Config mSessionConfig;
+    ModelConfig mModelConfig;
     WorldConfig const mWorldConfig;
     int mDevice{-1};
     std::shared_ptr<NcclCommunicator> mPipelineComm;
@@ -381,6 +438,13 @@ private:
     std::vector<CudaGraphExecutor> mCudaGraphInstances;
 
     bool mNormalizeLogProbs = true;
+    bool mIsMedusa = false;
+    std::string mTrieName = "";
+    bool mUseTrie = false;
+#ifdef WITH_TIME_PROFILE
+    Timer mEncoderTime;
+    Timer mDecoderTime;
+#endif
 };
 
 } // namespace tensorrt_llm::runtime

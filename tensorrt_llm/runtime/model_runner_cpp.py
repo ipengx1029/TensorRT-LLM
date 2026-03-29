@@ -24,7 +24,7 @@ import tensorrt_llm.bindings.executor as trtllm
 from .. import profiler
 from ..bindings import (DataType, GenerationInput, GenerationOutput,
                         GptJsonConfig, GptSession, GptSessionConfig,
-                        KvCacheConfig, ModelConfig, PromptTuningParams)
+                        KvCacheConfig, ModelConfig, PromptTuningParams, TrieConfig)
 from ..bindings import SamplingConfig as GptSamplingConfig
 from ..bindings import WorldConfig
 from ..logger import logger
@@ -66,6 +66,7 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
                                tp_size=world_config.tensor_parallelism,
                                pp_size=world_config.pipeline_parallelism)
         self.world_config = world_config
+        # print("init world_config.")
 
     @classmethod
     def from_dir(cls,
@@ -83,7 +84,9 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
                  medusa_choices: list[list[int]] | None = None,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
-                 gpu_weights_percent: float = 1) -> 'ModelRunnerCpp':
+                 gpu_weights_percent: float = 1,
+                 inflight_batching=False,
+                 **kwargs) -> 'ModelRunnerCpp':
 
         config_path = Path(engine_dir) / "config.json"
         json_config = GptJsonConfig.parse_file(config_path)
@@ -124,12 +127,14 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
             max_beam_width = model_config.max_beam_width
         else:
             assert max_beam_width <= model_config.max_beam_width
-
+        # add support for inflight batching
+        batching_type = trtllm.BatchingType.INFLIGHT if inflight_batching else trtllm.BatchingType.STATIC
         executor = trtllm.Executor(
             engine_dir, trtllm.ModelType.DECODER_ONLY,
             trtllm.ExecutorConfig(max_beam_width=max_beam_width,
                                   kv_cache_config=kv_cache_config,
-                                  medusa_choices=medusa_choices))
+                                  medusa_choices=medusa_choices,
+                                  batching_type=batching_type))
 
         profiler.stop('load tensorrt_llm engine')
 
@@ -292,7 +297,7 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
                 "top_p_decay", "random_seed", "temperature", "min_length",
                 "beam_search_diversity_rate", "repetition_penalty",
                 "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping"
+                "early_stopping", "enable_trie", "bizid"
             ]
             rename_params = {"num_beams": "beam_width"}
             sampling_params = {
@@ -328,6 +333,7 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
                 )
                 sampling_config.temperature = None
                 sampling_config.top_k = 1
+        #print("sampling_config:", sampling_config)
 
         self._check_inputs(batch_input_ids_list, sampling_config,
                            max_new_tokens)
@@ -493,6 +499,26 @@ class ModelRunnerCppExecutor(ModelRunnerMixin):
                     ]
                 outputs['cum_log_probs'] = torch.tensor(
                     outputs['cum_log_probs'], device=cuda_device)
+            if getattr(self.model_config, "nlu_scores_size", 0) > 0:
+                outputs['nlu_scores'] = []
+                for response in responses:
+                    outputs['nlu_scores'] += [
+                        a.result.nlu_score for a in response
+                        if a.result.nlu_score is not None
+                    ]
+                outputs['nlu_scores'] = torch.tensor(outputs['nlu_scores'],
+                                                    device=cuda_device)
+
+            if getattr(self.model_config, "context_features_size", 0) > 0:
+                outputs['context_features'] = []
+                for response in responses:
+                    outputs['context_features'] += [
+                        a.result.context_features for a in response
+                        if a.result.context_features is not None
+                    ]
+                outputs['context_features'] = torch.tensor(
+                    outputs['context_features'], device=cuda_device)
+
             input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
                                          dtype=torch.int32,
                                          device=cuda_device)
@@ -562,8 +588,8 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
                  medusa_choices: list[list[int]] | None = None,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
-                 gpu_weights_percent: float = 1) -> 'ModelRunnerCpp':
-
+                 gpu_weights_percent: float = 1,
+                 **kwargs) -> 'ModelRunnerCpp':
         # session setup
         config_path = Path(engine_dir) / "config.json"
         json_config = GptJsonConfig.parse_file(config_path)
@@ -575,15 +601,17 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
         world_config = WorldConfig.mpi(tensor_parallelism=tp_size,
                                        pipeline_parallelism=pp_size,
                                        gpus_per_node=gpus_per_node)
+        # print("world_config:", world_config)
+        # print("world_config:", model_config.nlu_scores_size)
         assert rank == world_config.rank
         engine_filename = json_config.engine_filename(world_config)
         serialize_path = Path(engine_dir) / engine_filename
 
-        if medusa_choices:
-            raise RuntimeError(
-                "Medusa is not supported in GptSession C++ session.\n"
-                "Build engine with gpt attention plugin, packed input and paged kv cache\n"
-                "for Medusa support.")
+        # if medusa_choices:
+        #     raise RuntimeError(
+        #         "Medusa is not supported in GptSession C++ session.\n"
+        #         "Build engine with gpt attention plugin, packed input and paged kv cache\n"
+        #         "for Medusa support.")
 
         profiler.start('load tensorrt_llm engine')
         if max_beam_width is None:
@@ -607,11 +635,29 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_sequence_length=max_seq_len,
-            gpu_weights_percent=gpu_weights_percent)
+            gpu_weights_percent=gpu_weights_percent,
+            medusa_choices=medusa_choices)
         session_config.kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_attention_window=max_attention_window_size,
             sink_token_length=sink_token_length)
+        session_config.cuda_graph_mode = kwargs.get("cuda_graph_mode", False)
+        session_config.decoder_per_request = kwargs.get("decoder_per_request", False)
+        session_config.enable_trie = kwargs.get("enable_trie", 0)
+        session_config.end_id = kwargs.get("end_id", 29983)
+        print(f'successfully get session_config.end_id : {session_config.end_id} .')
+        # if session_config.enable_trie == 1:
+        #     session_config.trie_map = dict([("default_trie", "./trie_data")])
+        # else: 
+        #     session_config.trie_map = dict()
+        if session_config.enable_trie == 1:
+            trie_config = TrieConfig()
+            trie_config.path = "./trie_data"
+            trie_config.enable_bizid = kwargs.get("enable_bizid", 0)
+            session_config.trie_map = dict([("default_trie", trie_config)])
+        else:
+            session_config.trie_map = dict()
+        print("successfully load gptsesstion")
         session = GptSession(config=session_config,
                              model_config=model_config,
                              world_config=world_config,
@@ -629,6 +675,23 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
                    max_input_len=max_input_len,
                    max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width)
+
+    def add_engine(self, engine_dir: str):
+        """ add engine to gptsession """
+        config_path = Path(engine_dir) / "config.json"
+        json_config = GptJsonConfig.parse_file(config_path)
+        model_config = json_config.model_config
+
+        tp_size = json_config.tensor_parallelism
+        pp_size = json_config.pipeline_parallelism
+        gpus_per_node = json_config.gpus_per_node
+        world_config = WorldConfig.mpi(tensor_parallelism=tp_size,
+                                       pipeline_parallelism=pp_size,
+                                       gpus_per_node=gpus_per_node)
+        engine_filename = json_config.engine_filename(world_config)
+        serialize_path = Path(engine_dir) / engine_filename
+
+        self.session.add_engine(model_config, str(serialize_path))
 
     @property
     def dtype(self) -> torch.dtype:
@@ -672,6 +735,15 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
     @property
     def gather_context_logits(self) -> bool:
         return self.session.model_config.compute_context_logits
+
+    @property
+    def nlu_scores_size(self) -> int:
+        return getattr(self.session.model_config, "nlu_scores_size", 0)
+
+    @property
+    def context_features_size(self) -> int:
+        """ context_features_size """
+        return getattr(self.session.model_config, "context_features_size", 0)
 
     @property
     def gather_generation_logits(self) -> bool:
@@ -776,7 +848,24 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
         output_lengths = torch.empty((batch_size, sampling_config.num_beams),
                                      dtype=torch.int32,
                                      device=cuda_device)
-        generation_output = GenerationOutput(output_ids, output_lengths)
+        generation_output_kwargs = {
+            'ids': output_ids,
+            'lengths': output_lengths
+        }
+        if self.nlu_scores_size > 0:
+            #print("model cpp use nlu layer")
+            # TODO nlu config
+            nlu_scores = torch.empty(
+                (batch_size, sampling_config.num_beams, self.nlu_scores_size),
+                dtype=torch.float32,
+                device=cuda_device)
+            generation_output_kwargs['nlu_scores'] = nlu_scores
+        if self.context_features_size > 0:
+            context_features = torch.empty(
+                (batch_size, self.context_features_size),
+                device=cuda_device)
+            generation_output_kwargs['context_features'] = context_features
+        generation_output = GenerationOutput(**generation_output_kwargs)
         if sampling_config.output_cum_log_probs:
             generation_output.cum_log_probs = torch.empty(
                 (batch_size, sampling_config.num_beams),
@@ -797,7 +886,6 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
                 (batch_size, sampling_config.num_beams,
                  sampling_config.max_new_tokens, self.vocab_size_padded),
                 device=cuda_device)
-
         self.session.generate(generation_output, generation_input,
                               gpt_sampling_config)
         if sampling_config.return_dict:
@@ -813,6 +901,11 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
             if self.gather_generation_logits:
                 outputs[
                     'generation_logits'] = generation_output.generation_logits
+            if self.nlu_scores_size > 0:
+                # TODO nlu config
+                outputs['nlu_scores'] = generation_output.nlu_scores
+            if self.context_features_size > 0:
+                outputs['context_features'] = generation_output.context_features
             outputs = self._prepare_outputs(outputs, input_lengths)
         else:
             outputs = generation_output.ids
@@ -822,7 +915,6 @@ class ModelRunnerCppGptSession(ModelRunnerMixin):
 def _populate_sampling_config(sampling_config: SamplingConfig,
                               batch_size: int) -> GptSamplingConfig:
     gpt_sampling_config = GptSamplingConfig(sampling_config.num_beams)
-
     if isinstance(sampling_config.beam_search_diversity_rate, torch.Tensor):
         assert sampling_config.beam_search_diversity_rate.dtype == torch.float32, f"sampling_config.beam_search_diversity_rate.dtype ({sampling_config.beam_search_diversity_rate.dtype}) must be torch.float32"
         assert sampling_config.beam_search_diversity_rate.shape[
@@ -926,6 +1018,16 @@ def _populate_sampling_config(sampling_config: SamplingConfig,
         gpt_sampling_config.top_k = sampling_config.top_k.tolist()
     else:
         gpt_sampling_config.top_k = [sampling_config.top_k]
+    
+    if isinstance(sampling_config.bizid, torch.Tensor):
+        assert sampling_config.bizid.dtype == torch.int32, \
+               f"sampling_config.bizid.dtype ({sampling_config.bizid.dtype}) must be torch.int32"
+        assert sampling_config.bizid.shape[0] == batch_size, f"sampling_config.bizid.shape[0] \
+               ({sampling_config.bizid.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.bizid = sampling_config.bizid.tolist()
+    else:
+        gpt_sampling_config.bizid = sampling_config.bizid
+
 
     if isinstance(sampling_config.top_p, torch.Tensor):
         assert sampling_config.top_p.dtype == torch.float32, f"sampling_config.top_p.dtype ({sampling_config.top_p.dtype}) must be torch.float32"
@@ -934,6 +1036,19 @@ def _populate_sampling_config(sampling_config: SamplingConfig,
         gpt_sampling_config.top_p = sampling_config.top_p.tolist()
     else:
         gpt_sampling_config.top_p = [sampling_config.top_p]
+
+    if isinstance(sampling_config.enable_trie, torch.Tensor):
+        assert sampling_config.enable_trie.dtype == \
+            torch.int32, f"sampling_config.enable_trie.dtype \
+            ({sampling_config.enable_trie.dtype}) must be torch.int32"
+        assert sampling_config.enable_trie.shape[
+            0] == batch_size, f"sampling_config.enable_trie.shape[0] \
+            ({sampling_config.enable_trie.shape[0]}) must equal to batch_size ({batch_size})"
+        gpt_sampling_config.enable_trie = sampling_config.enable_trie.tolist()
+    else:
+        gpt_sampling_config.enable_trie = [sampling_config.enable_trie]
+    
+    gpt_sampling_config.trie_name = ['default_trie']
 
     if sampling_config.top_p_decay is not None:
         gpt_sampling_config.top_p_decay = sampling_config.top_p_decay.tolist()
@@ -995,7 +1110,8 @@ class ModelRunnerCpp:
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
 
-        if model_config.supports_inflight_batching:
+        if model_config.supports_inflight_batching and kwargs.get("inflight_batching", True):
+            logger.warning("Using inflight batching in ModelRunnerCpp.")
             return ModelRunnerCppExecutor.from_dir(engine_dir, **kwargs)
         else:
             logger.warning("Using deprecated GptSession ModelRunnerCpp.")
