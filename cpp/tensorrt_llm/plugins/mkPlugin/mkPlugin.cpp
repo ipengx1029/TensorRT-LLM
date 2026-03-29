@@ -26,19 +26,19 @@ static inline int get_sms_count(void) {
     return prop.multiProcessorCount;
 }
 
-MkPlugin::MkPlugin(int model_type, int numHeads, int vocabSize,
+MkPlugin::MkPlugin(int model_type, int quant_type, int numHeads, int vocabSize,
                    int intermediateSize, int headDim, int numHiddenLayers,
                    int numKeyvalueHeads, int hiddenSize)
-    : mModelType(model_type), mNumHeads(numHeads), mVocabSize(vocabSize),
+    : mModelType(model_type), mQuantType(quant_type), mNumHeads(numHeads), mVocabSize(vocabSize),
       mIntermediateSize(intermediateSize), mHeadDim(headDim),
       mNumHiddenLayers(numHiddenLayers), mNumKeyvalueHeads(numKeyvalueHeads),
       mHiddenSize(hiddenSize) {
     int sms_count = get_sms_count();
-    mModelInfer = mk::get_model_infer(model_type, sms_count);
+    mModelInfer = mk::get_model_infer(model_type, quant_type, sms_count);
     TLLM_CHECK_WITH_INFO(mModelInfer != nullptr, 
         "MKPLugin get model infer nullptr error");
-    TLLM_LOG_WARNING("initialize mkplugin sms_count=%d, model_type=%d", 
-        sms_count, model_type);
+    TLLM_LOG_WARNING("initialize mkplugin sms_count=%d, model_type=%d, quant_type=%d", 
+        sms_count, model_type, quant_type);
     mNumInputs = 0;
     mParams.pos_id = 0;
     mParams.tokens_num = 0;
@@ -49,6 +49,7 @@ MkPlugin::MkPlugin(const void *data, size_t length) {
     char const *d = reinterpret_cast<char const *>(data);
     auto const *a = d;
     read(d, mModelType);
+    read(d, mQuantType);
     read(d, mNumHeads);
     read(d, mVocabSize);
     read(d, mIntermediateSize);
@@ -74,7 +75,7 @@ int MkPlugin::initialize() noexcept {
 void MkPlugin::terminate() noexcept {}
 
 size_t MkPlugin::getSerializationSize() const noexcept {
-    return sizeof(mModelType) + sizeof(mNumHeads) + sizeof(mVocabSize) +
+    return sizeof(mModelType) + sizeof(mQuantType) + sizeof(mNumHeads) + sizeof(mVocabSize) +
            sizeof(mIntermediateSize) + sizeof(mHeadDim) +
            sizeof(mNumHiddenLayers) + sizeof(mNumKeyvalueHeads) +
            sizeof(mHiddenSize);
@@ -84,6 +85,7 @@ void MkPlugin::serialize(void *buffer) const noexcept {
     char *d = static_cast<char *>(buffer);
     char *a = d;
     write(d, mModelType);
+    write(d, mQuantType);
     write(d, mNumHeads);
     write(d, mVocabSize);
     write(d, mIntermediateSize);
@@ -98,7 +100,7 @@ void MkPlugin::destroy() noexcept {
 }
 
 IPluginV2DynamicExt *MkPlugin::clone() const noexcept {
-    return new MkPlugin(mModelType, mNumHeads, mVocabSize, mIntermediateSize,
+    return new MkPlugin(mModelType, mQuantType, mNumHeads, mVocabSize, mIntermediateSize,
                         mHeadDim, mNumHiddenLayers, mNumKeyvalueHeads,
                         mHiddenSize);
 }
@@ -186,6 +188,21 @@ void MkPlugin::set_mk_gl_tensor(
     mParams.silu_out.dim.d[1] = mIntermediateSize;
     mParams.silu_out.ptr = (void *)ptr;
 }
+// update gptq quant tensor
+void MkPlugin::update_gptq_gl_tensor(const int start_idx, 
+    const nvinfer1::PluginTensorDesc *inputDesc, const void *const *inputs) {
+    int offset = start_idx;
+    // gptq scales weights
+    mParams.qkv_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    ++offset;
+    mParams.o_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    ++offset;
+    mParams.up_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    ++offset;
+    mParams.gate_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+    ++offset;
+    mParams.down_proj_scales = {(void *)inputs[offset], &inputDesc[offset].dims};
+}
 int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
                       const PluginTensorDesc *outputDesc,
                       const void *const *inputs, void *const *outputs,
@@ -243,10 +260,18 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
 
     // Qwen qkv norm
     if (mModelType == 1) {
-        TLLM_CHECK_WITH_INFO(mNumInputs == 21, "MKPLugin qwen model need 21 inputs");
         mParams.q_norm_weights = {(void *)inputs[19], &inputDesc[19].dims};
         mParams.k_norm_weights = {(void *)inputs[20], &inputDesc[20].dims};
+        if (mQuantType == 1) {
+            TLLM_CHECK_WITH_INFO(mNumInputs == 26, "MKPLugin qwen quant model need 26 inputs");
+            update_gptq_gl_tensor(21, inputDesc, inputs);
+        } else {
+            TLLM_CHECK_WITH_INFO(mNumInputs == 21, "MKPLugin qwen model need 21 inputs");
+        }
+    } else if (mQuantType == 1) {
+        update_gptq_gl_tensor(19, inputDesc, inputs);
     }
+    // output
     mParams.logits = {(void *)outputs[0], &outputDesc[0].dims};
     // model infer
     mModelInfer->infer(&mParams, stream);
@@ -256,6 +281,7 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
 
 ::std::vector<PluginField> MkPluginCreator::mPluginAttributes{
     {"model_type", nullptr, PluginFieldType::kINT32, 1},
+    {"quant_type", nullptr, PluginFieldType::kINT32, 1},
     {"num_heads", nullptr, PluginFieldType::kINT32, 1},
     {"vocab_size", nullptr, PluginFieldType::kINT32, 1},
     {"intermediate_size", nullptr, PluginFieldType::kINT32, 1},
@@ -285,13 +311,16 @@ const PluginFieldCollection *MkPluginCreator::getFieldNames() noexcept {
 IPluginV2 *
 MkPluginCreator::createPlugin(const char *name,
                               const PluginFieldCollection *fc) noexcept {
-    int model_type, numHeads = 0, headSize = 0, vocabSize = 0,
+    int model_type, quant_type = 0, numHeads = 0, headSize = 0, vocabSize = 0,
                     intermediateSize = 0;
     int headDim = 0, numHiddenLayers = 0, numKeyvalueHeads = 0, hiddenSize = 0;
     for (int i = 0; i < fc->nbFields; ++i) {
         ::std::string fname(fc->fields[i].name);
         if (fname == "model_type") {
             model_type = *static_cast<const int *>(fc->fields[i].data);
+        }
+        if (fname == "quant_type") {
+            quant_type = *static_cast<const int *>(fc->fields[i].data);
         }
         if (fname == "num_heads") {
             numHeads = *static_cast<const int *>(fc->fields[i].data);
@@ -315,7 +344,7 @@ MkPluginCreator::createPlugin(const char *name,
             hiddenSize = *static_cast<const int *>(fc->fields[i].data);
         }
     }
-    return new MkPlugin(model_type, numHeads, vocabSize, intermediateSize,
+    return new MkPlugin(model_type, quant_type, numHeads, vocabSize, intermediateSize,
                         headDim, numHiddenLayers, numKeyvalueHeads, hiddenSize);
 }
 

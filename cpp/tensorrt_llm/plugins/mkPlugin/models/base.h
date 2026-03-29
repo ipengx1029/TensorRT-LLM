@@ -53,6 +53,13 @@ struct MKGlobals {
     // batch size
     bool encoder;
     int batch_size;
+
+    // gptq scales
+    MKTensor qkv_proj_scales;
+    MKTensor o_proj_scales;
+    MKTensor up_proj_scales;
+    MKTensor gate_proj_scales;
+    MKTensor down_proj_scales;
 };
 template<typename T>
 inline size_t zero_mk_tensor(MKTensor &tensor, cudaStream_t stream) {
@@ -71,5 +78,5 @@ public:
 };
 // get model infer
 extern std::shared_ptr<ModelInfer> get_model_infer(
-    const int model_type, const int sms_count);
+    const int model_type, const int quant_type, const int sms_count);
 } // namespace mk

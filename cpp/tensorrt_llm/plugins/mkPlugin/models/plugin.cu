@@ -1,5 +1,5 @@
 #include "base.h"
-#include "qwen.cu"
+#include "qwen.h"
 namespace mk {
 std::shared_ptr<ModelInfer> get_model_infer(const int model_type, const int sms_count) {
     std::shared_ptr<ModelInfer> infer = nullptr;

@@ -14,7 +14,7 @@ namespace tensorrt_llm {
 namespace plugins {
 class MkPlugin : public BasePlugin {
 public:
-    MkPlugin(int model_type, int numHeads, int vocabSize, int intermediateSize,
+    MkPlugin(int model_type, int quant_type, int numHeads, int vocabSize, int intermediateSize,
              int headDim, int numHiddenLayers, int numKeyvalueHeads,
              int hiddenSize);
     MkPlugin(const void *data, size_t length);
@@ -60,9 +60,13 @@ public:
     // set mk templ gl tensor
     void set_mk_gl_tensor(const int token_nums, 
         const nvinfer1::PluginTensorDesc *input, void *workspace);
+    // update gptq quant tensor
+    void update_gptq_gl_tensor(const int start_idx, 
+        const nvinfer1::PluginTensorDesc *inputDesc, const void *const *inputs);
 
   private:
     int mModelType;
+    int mQuantType;
     int mNumHeads;
     int mVocabSize;
     int mIntermediateSize;

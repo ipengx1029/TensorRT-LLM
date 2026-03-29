@@ -34,10 +34,9 @@ def parse_arguments():
     parser.add_argument('--max_output_len', type=int, default=100)
     parser.add_argument('--output_dir', type=str, default='./mk_engine')
     parser.add_argument('--rank', type=int, default=0)
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='bfloat16',
-                        choices=['bfloat16'])
+    parser.add_argument('--dtype', type=str, default='bfloat16', choices=['bfloat16'])
+    parser.add_argument('--qformat', type=str, default='bfloat16', 
+                        choices=['bfloat16', 'int4_sync_g128'])
     return parser.parse_args()
 
 def load_weights_from_hf(model_dir, extra_config):
@@ -47,7 +46,7 @@ def load_weights_from_hf(model_dir, extra_config):
     print("model loaded")
     schedule_builder = make_schedule_builder('latency')
     print("get schedule_builder")
-    schedule = schedule_builder.build(model)
+    schedule = schedule_builder.build(model, qformat=extra_config.qformat)
     print("schedule built")
     assigned_to_sms = assign_to_sms(
         'rr', schedule=schedule
@@ -75,10 +74,17 @@ def load_weights_from_hf(model_dir, extra_config):
         'q_norm_weights':schedule.globs.q_norm_weights,
         'k_norm_weights':schedule.globs.k_norm_weights,
     }
+    # add quant scales if they exist
+    if extra_config.qformat == "int4_sync_g128":
+        weights["qkv_proj_scales"] = schedule.globs.qkv_proj_scales
+        weights["o_proj_scales"] = schedule.globs.o_proj_scales
+        weights["up_proj_scales"] = schedule.globs.up_proj_scales
+        weights["gate_proj_scales"] = schedule.globs.gate_proj_scales
+        weights["down_proj_scales"] = schedule.globs.down_proj_scales
 
     return weights
 
-def convert2model(model, weights):
+def convert2model(model, weights, extra_config):
     print("loading weight to trt model")
     model.qkv_proj_weights.value = weights['qkv_proj_weights'].to('cuda')
     model.o_proj_weights.value = weights['o_proj_weights'].to('cuda')
@@ -97,6 +103,13 @@ def convert2model(model, weights):
     model.instructions = Parameter(value=weights['instructions'].to('cuda'), shape=weights['instructions'].shape)
     model.timings = Parameter(value=weights['timings'].to('cuda'), shape=weights['timings'].shape)
     model.vocab_embedding.weight.value = weights['embeddings'].to('cuda')
+    if extra_config.qformat == "int4_sync_g128":
+        print("load quant weight params")
+        model.qkv_proj_scales.value = weights["qkv_proj_scales"].to('cuda')
+        model.o_proj_scales.value = weights["o_proj_scales"].to('cuda')
+        model.up_proj_scales.value = weights["up_proj_scales"].to('cuda')
+        model.gate_proj_scales.value = weights["gate_proj_scales"].to('cuda')
+        model.down_proj_scales.value = weights["down_proj_scales"].to('cuda')
     print("loaded weight to trt model")
 
 def save_checkpoint(model, output_dir, save_config=True):
@@ -118,10 +131,11 @@ def from_huggin_face(args):
         interleave_rope=True,
         max_len_override = max_seq_len,
         max_batch_size = args.max_batch_size,
+        qformat=args.qformat
     )
-    model = Qwen3MegaKernel(config)
+    model = Qwen3MegaKernel(config, args.qformat)
     weights = load_weights_from_hf(args.model_dir, extra_config)
-    convert2model(model, weights)
+    convert2model(model, weights, extra_config)
     return model
 
 def main():

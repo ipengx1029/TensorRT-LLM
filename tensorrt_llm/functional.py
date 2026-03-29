@@ -35,7 +35,7 @@ from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields
 
 
 class DimRange(object):
@@ -2323,6 +2323,128 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
 
     return _create_tensor(layer.get_output(0), layer)
 
+def gather_hidden_by_ids(hidden_states: Tensor,
+                         ids: Tensor,
+                         remove_input_padding: bool) -> Tensor:
+    '''
+    Extract the logits that correspond to the last token from the hidden states.
+    Parameters:
+        hidden_states : Tensor
+            The hidden states
+        ids : Tensor
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+        remove_input_padding : bool
+            Indicate if the hidden_states are packed ('True') or padded
+            ('False').
+    Returns:
+        The tensor created by that sequence of operations.
+    '''
+    if ids is None:
+        return hidden_states
+
+    if remove_input_padding:
+        hidden_states = index_select(hidden_states, 0, ids)  # [seq_len, hidden]
+        hidden_states = hidden_states.view(
+            concat([shape(ids, 0), shape(hidden_states, 1)]))
+    else:
+        ndim = ids.ndim()
+        if ndim == 1:
+            # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]
+            ids = ids.view(concat([shape(ids, 0), 1, 1]))
+            ids = expand(ids,
+                            concat([shape(ids, 0), 1, shape(hidden_states, 2)]))
+            hidden_states = gather(
+                hidden_states, dim=1, indices=ids).view(
+                    concat([shape(hidden_states, 0),
+                            shape(hidden_states, 2)]))
+        elif ndim == 2:
+            # ids is of shape [batch_size, num_last_tokens]
+            # So [batch_size, seqlen, hidden_size] -> [batch_size, num_last_tokens, hidden_size]
+            ids = ids.view(concat([shape(ids, 0), shape(ids, 1), 1]))
+            ids = expand(
+                ids,
+                concat([
+                    shape(ids, 0),
+                    shape(ids, 1),
+                    shape(hidden_states, 2)
+                ]))
+            hidden_states = gather(hidden_states, dim=1, indices=ids)
+    return hidden_states
+
+def _encoder_post_pooling_plugin(hidden_states: Tensor,
+                                 input_sequence_lengths: Tensor,
+                                 with_padding: bool,
+                                 process: str) -> Tensor:
+    '''
+    Add an operation to postprocess hidden states after encoding.
+
+    That operation removes padding tokens and applies reduce operations.
+
+    Parameters:
+        hidden_states : Tensor
+            The hidden states to be processed.
+
+        input_sequence_lengths : Tensor
+            The lengths of each sequence in the batch.
+
+        with_padding : bool
+            Whether hidden_states has padding tokens.
+
+        process : int
+            0: SUM
+            1: MAX
+            2: MIN
+            3: AVG
+
+    Returns:
+        The reduced hidden states.
+    '''
+    process_map = {"SUM": 0, "MAX": 1, "MIN": 2, "AVG": 3}
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'EncoderPostPooling', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = hidden_states.dtype
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(p_dtype)], np.int32),
+        trt.PluginFieldType.INT32)
+
+    remove_padding = trt.PluginField("remove_padding", np.array([int(with_padding)], np.int32),
+                           trt.PluginFieldType.INT32)
+
+    print("using EncoderPostPooling plugin: ", process)
+    print("process type: ", process_map[process])
+
+    process_type = trt.PluginField("process_type", np.array([int(process_map[process])], np.int32),
+                           trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection([pf_type, remove_padding, process_type])
+    post_pooling_plug = plg_creator.create_plugin("post_pooling", pfc)
+    plug_inputs = [hidden_states.trt_tensor, input_sequence_lengths.trt_tensor]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, post_pooling_plug)
+    _add_plugin_info(layer, plg_creator, "post_pooling", pfc)
+    return _create_tensor(layer.get_output(0), layer)
+
+def encoder_post_pooling(hidden_states: Tensor, input_sequence_lengths: Tensor, with_padding: bool) -> Tensor:
+    '''
+    Add an operation to postprocess hidden states after encoding.
+
+    Parameters:
+        hidden_states : Tensor
+            The hidden states to be processed.
+
+        input_sequence_lengths : Tensor
+            The lengths of each sequence in the batch.
+
+        with_padding : bool
+            Whether hidden_states has padding tokens.
+    '''
+    if default_net().plugin_config.post_pooling_plugin:
+        return _encoder_post_pooling_plugin(hidden_states, input_sequence_lengths, with_padding,
+                                            default_net().plugin_config.post_pooling_plugin)
+    else:
+        return hidden_states
 
 def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
     '''
@@ -3713,7 +3835,14 @@ def bert_attention(tensor: Tensor,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
                    max_distance: int = 0,
-                   max_input_length: Tensor = None) -> Tuple[Tensor]:
+                   max_input_length: Tensor = None,
+                   used_kv_cache: bool = False,
+                   kv_cache: Tensor = None,
+                   max_cache_offsets: Tensor = None,
+                   cache_offsets: Tensor = None,
+                   spec_decoding_enabled: bool = False,
+                   spec_decoding_packed_mask: Tensor = None,
+                   id: int = 0) -> Tensor:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -3773,7 +3902,8 @@ def bert_attention(tensor: Tensor,
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'BertAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert attn_plg_creator is not None
-
+    id = trt.PluginField("id", np.array(id, dtype=np.int32),
+                        trt.PluginFieldType.INT32)
     nheads = trt.PluginField("num_heads", np.array(num_heads, dtype=np.int32),
                              trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size", np.array(head_size,
@@ -3806,9 +3936,20 @@ def bert_attention(tensor: Tensor,
         "remove_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+
+    pf_used_kv_cache = trt.PluginField(
+        "used_kv_cache",
+        np.array(np.int8(used_kv_cache),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    pf_spec_decoding_enabled = trt.PluginField(
+        "spec_decoding_enabled",
+        np.array(np.int8(spec_decoding_enabled),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
     pfc = trt.PluginFieldCollection([
-        nheads, head_size, q_scaling, enable_qk_half_accum, context_fmha_type,
-        pf_type, do_relative_attention, max_distance, remove_padding
+        id, nheads, head_size, q_scaling, enable_qk_half_accum, context_fmha_type,
+        pf_type, do_relative_attention, max_distance, remove_padding,
+        pf_used_kv_cache, pf_spec_decoding_enabled
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -3820,6 +3961,13 @@ def bert_attention(tensor: Tensor,
         # for relative attention mode
         plug_inputs += [relative_attention_bias]
 
+    if kv_cache is not None:
+        # for kv cache mode
+        plug_inputs += [kv_cache, max_cache_offsets, cache_offsets]
+    if spec_decoding_packed_mask is not None:
+        # for special decoding mode
+        plug_inputs += [spec_decoding_packed_mask]
+
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
@@ -3829,7 +3977,6 @@ def bert_attention(tensor: Tensor,
     output = _create_tensor(layer.get_output(0), layer)
     assert output is not None
     return output
-
 
 class RopeEmbeddingUtils:
 
@@ -4179,6 +4326,7 @@ def gpt_attention(
     use_cache: bool = True,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
+    unidirectional: int = 1,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4415,7 +4563,7 @@ def gpt_attention(
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
     unidirectional = trt.PluginField("unidirectional",
-                                     np.array(1, dtype=np.int32),
+                                     np.array(unidirectional, dtype=np.int32),
                                      trt.PluginFieldType.INT32)
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
@@ -4908,6 +5056,39 @@ def expand_mask(mask: Tensor, tgt_len: Optional[Tensor] = None) -> Tensor:
     mask = where(mask == 0, float('-inf'), 0.0)
     return mask
 
+def gather_first_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
+                             remove_input_padding: bool) -> Tensor:
+    """
+    gather_first_token_logits
+    """
+    if last_token_ids is None:
+        return hidden_states
+
+    if remove_input_padding:
+        size = shape(last_token_ids, 0) - 1
+        starts = constant(dims_array([0]))
+        last_token_ids = slice(last_token_ids, starts, size)
+
+        last_token_ids = concat([constant(int32_array(0)), last_token_ids])
+
+        hidden_states = index_select(hidden_states, 0,
+                                     last_token_ids)  # [seq_len, hidden]
+        hidden_states = hidden_states.view(
+            concat([shape(last_token_ids, 0),
+                    shape(hidden_states, 1)]))
+    else:
+        last_token_ids = last_token_ids.view(
+                concat([shape(last_token_ids, 0), 1, 1]))
+        last_token_ids = expand(
+            last_token_ids,
+            concat([shape(last_token_ids, 0), 1,
+                    shape(hidden_states, 2)]))
+        last_token_ids = last_token_ids * 0
+        hidden_states = gather(
+            hidden_states, dim=1, indices=last_token_ids).view(
+                concat([shape(hidden_states, 0),
+                        shape(hidden_states, 2)]))
+    return hidden_states
 
 def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
                              remove_input_padding: bool) -> Tensor:
@@ -5588,3 +5769,184 @@ def topk(input: Tensor,
     indices = layer.get_output(1)
 
     return _create_tensor(values, layer), _create_tensor(indices, layer)
+
+def debug_print(name: str, data: Tensor, sample: bool=True) -> Tensor:
+    """
+    Add print debug op.
+    """
+    if not default_net().plugin_config.debug_print:
+        return data
+    print_creator = trt.get_plugin_registry().get_plugin_creator(
+        'DebugPrintPlugin', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert print_creator is not None
+
+    p_dtype = data.dtype
+    pf_type = trt.PluginField("type_id",
+                              np.array([int(p_dtype)], np.int32),
+                              trt.PluginFieldType.INT32)
+    pf_sample = trt.PluginField("sample",
+                                np.array([int(sample)], np.int32),
+                                trt.PluginFieldType.INT32)
+    print("debug type: ", name, p_dtype, ", sample=", sample)
+    pfc = trt.PluginFieldCollection([pf_type, pf_sample])
+
+    plugin_name = "debug_print" + name
+    print_creator_plug = print_creator.create_plugin(plugin_name, pfc)
+
+    plug_inputs = [data.trt_tensor]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, print_creator_plug)
+    _add_plugin_info(layer, print_creator, plugin_name, pfc)
+
+    return _create_tensor(layer.get_output(0), layer)
+
+@dataclass
+class MKScalesParams(object):
+    """ mk quant globals """
+    qkv_proj_scales: Tensor
+    o_proj_scales: Tensor
+    up_proj_scales: Tensor
+    gate_proj_scales: Tensor
+    down_proj_scales: Tensor
+
+@dataclass
+class MKGlobals(object):
+    """ mk globals inputs """
+    # from inputs
+    hidden_states: Tensor
+    input_lengths: Tensor
+    # model parameters, all layers stacked together in order
+    qkv_proj_weights: Tensor
+    attn_ln_weights: Tensor
+    o_proj_weights: Tensor
+    mlp_ln_weights: Tensor
+    up_proj_weights: Tensor
+    gate_proj_weights: Tensor
+    down_proj_weights: Tensor
+    lm_head_norm_weights: Tensor
+    lm_head_weights: Tensor
+    # not stacked for each layer
+    rope_cos: Tensor
+    rope_sin: Tensor
+    # qk norm weights
+    q_norm_weights: Tensor
+    k_norm_weights: Tensor
+
+    # instructions
+    instructions: Tensor
+    timings: Tensor
+    barriers: Tensor
+    # kvcache
+    k_cache: Tensor
+    v_cache: Tensor
+    # batch size
+    bs_params: Tensor
+    # scales params
+    scales_params: MKScalesParams
+
+def mk_plugin(
+    model_type: int,
+    globals: MKGlobals,
+    num_heads: int,
+    vocab_size: int,
+    intermediate_size: int,
+    head_dim: int,
+    num_hidden_layers: int,
+    num_keyvalue_heads: int,
+    hidden_size: int,
+):
+    """ mk plugin """
+    attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        "MKPlugin", "1", TRT_LLM_PLUGIN_NAMESPACE
+    )
+    assert attn_plg_creator is not None, "MKPlugin plugin not found"
+    fl_model_type = trt.PluginField(
+        "model_type", np.array(model_type, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    qtype = 0 if globals.scales_params is None else 1
+    quant_type = trt.PluginField(
+        "quant_type", np.array(qtype, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    nheads = trt.PluginField(
+        "num_heads", np.array(num_heads, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    vocab_size = trt.PluginField(
+        "vocab_size", np.array(vocab_size, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    intermediate_size = trt.PluginField(
+        "intermediate_size", np.array(intermediate_size, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    head_dim = trt.PluginField(
+        "head_dim", np.array(head_dim, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    num_hidden_layers = trt.PluginField(
+        "num_hidden_layers", np.array(num_hidden_layers, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    num_keyvalue_heads = trt.PluginField(
+        "num_keyvalue_heads", np.array(num_keyvalue_heads, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+    hidden_size = trt.PluginField(
+        "hidden_size", np.array(hidden_size, dtype=np.int32), trt.PluginFieldType.INT32
+    )
+
+    pfc = trt.PluginFieldCollection([
+        fl_model_type, quant_type, nheads, vocab_size, intermediate_size, head_dim, 
+        num_hidden_layers, num_keyvalue_heads, hidden_size])
+    attn_plug = attn_plg_creator.create_plugin("mk_plugin", pfc)
+
+    tensor_order = [
+        # input
+        "hidden_states", 
+        "input_lengths",  
+        # parameters
+        "instructions", 
+        "timings",
+        "barriers",
+        "qkv_proj_weights", 
+        "attn_ln_weights", 
+        "o_proj_weights",
+        "mlp_ln_weights", 
+        "up_proj_weights", 
+        "gate_proj_weights", 
+        "down_proj_weights",
+        "lm_head_norm_weights", 
+        "lm_head_weights",
+        "rope_cos", 
+        "rope_sin",
+        # temp
+        "k_cache", 
+        "v_cache",  
+        "bs_params",
+        # qkv norm weight
+        "q_norm_weights",  #qwen
+        "k_norm_weights",  #qwen
+    ]
+
+    plug_inputs = []
+    for name in tensor_order:
+        # llama not need qk norm
+        if model_type == 0 and name in ["q_norm_weights", "k_norm_weights"]:
+            continue
+        if not hasattr(globals, name):
+            print(f"name: {name} not found")
+            continue
+        print(f"name: {name}")
+        value = getattr(globals, name, None)
+        if value is None:
+            print(f"name: {name} found is None skip it")
+            continue
+        plug_inputs.append(value.trt_tensor)
+        print(f"add tensor: {name} is {value}")
+
+    if not globals.scales_params is None:
+        for k, v in globals.scales_params.__dict__.items():
+            print(f"add scales param: {k} is {v}")
+            plug_inputs.append(v.trt_tensor)
+
+    print(f"num of plug_inputs={len(plug_inputs)}")
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
+    _add_plugin_info(layer, attn_plg_creator, "mk_plugin", pfc)
+
+    output = _create_tensor(layer.get_output(0), layer)
+    assert output is not None
+    return output

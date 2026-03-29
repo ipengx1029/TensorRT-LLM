@@ -5,20 +5,21 @@ from collections import OrderedDict
 from pathlib import Path
 import tensorrt as trt
 from transformers import Qwen3Config
-from tensorrt_llm.functional import mk_plugin, MKGlobals, Tensor, debug_print, cast
+from tensorrt_llm.functional import mk_plugin, MKGlobals, MKScalesParams, Tensor, debug_print, cast
 from tensorrt_llm.module import Module
 from ...layers import Embedding
 from ...parameter import Parameter
 
 class Qwen3MegaKernel(Module):
     """ qwen model """
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, quant_type: str):
         """ init """
         super().__init__()
         self.vocab_embedding = Embedding(
             config.vocab_size, config.hidden_size, dtype=config.torch_dtype
         )
         self.config = config
+        self.quant_type = quant_type
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.dtype = config.torch_dtype
@@ -32,16 +33,24 @@ class Qwen3MegaKernel(Module):
 
     def _init_weights(self):
         """init weights"""
-        print(f"self.dtype: {self.dtype}")
+        print(f"self.dtype: {self.dtype} quant_type {self.quant_type}")
+        if self.quant_type == "int4_sync_g128":
+            num_elem_weight = 4
+        else:
+            num_elem_weight = 1
         qkv_hidden = (self.hidden_size // self.num_attention_heads) * (
             self.num_attention_heads + self.num_key_value_heads * 2
         )
         self.qkv_proj_weights = Parameter(
-            shape=[self.num_hidden_layers, qkv_hidden, self.hidden_size],
+            shape=[self.num_hidden_layers, 
+                   qkv_hidden, 
+                   self.hidden_size // num_elem_weight],
             dtype=trt.bfloat16,
         )
         self.o_proj_weights = Parameter(
-            shape=[self.num_hidden_layers, self.hidden_size, self.hidden_size],
+            shape=[self.num_hidden_layers, 
+                   self.hidden_size, 
+                   self.hidden_size // num_elem_weight],
             dtype=trt.bfloat16,
         )
         self.attn_ln_weights = Parameter(
@@ -56,16 +65,20 @@ class Qwen3MegaKernel(Module):
             shape=[
                 self.num_hidden_layers,
                 self.intermediate_size,
-                self.hidden_size,
+                self.hidden_size // num_elem_weight,
             ],  # 28, 6144, 2048
             dtype=trt.bfloat16,
         )
         self.gate_proj_weights = Parameter(
-            shape=[self.num_hidden_layers, self.intermediate_size, self.hidden_size],
+            shape=[self.num_hidden_layers, 
+                   self.intermediate_size, 
+                   self.hidden_size // num_elem_weight],
             dtype=trt.bfloat16,
         )
         self.down_proj_weights = Parameter(
-            shape=[self.num_hidden_layers, self.hidden_size, self.intermediate_size],
+            shape=[self.num_hidden_layers, 
+                   self.hidden_size, 
+                   self.intermediate_size // num_elem_weight],
             dtype=trt.bfloat16,
         )
         self.lm_head_norm_weights = Parameter(
@@ -96,6 +109,41 @@ class Qwen3MegaKernel(Module):
         self.barriers = None
         # [56, 129, 128]
         self.timings = None
+
+        if self.quant_type == "int4_sync_g128":
+            group_size = 128
+            self.qkv_proj_scales = Parameter(
+                shape=[self.num_hidden_layers, 
+                       qkv_hidden, 
+                       self.hidden_size // group_size],
+                dtype=trt.bfloat16,
+            ) #torch.Size([28, 4096, 16]) torch.bfloat16
+            self.o_proj_scales = Parameter(
+                shape=[self.num_hidden_layers, 
+                       self.hidden_size, 
+                       self.hidden_size // group_size],
+                dtype=trt.bfloat16,
+            ) #torch.Size([28, 2048, 16]) torch.bfloat16
+            self.up_proj_scales = Parameter(
+                shape=[
+                    self.num_hidden_layers,
+                    self.intermediate_size,
+                    self.hidden_size // group_size,
+                ], 
+                dtype=trt.bfloat16,
+            ) #torch.Size([28, 6144, 16]) torch.bfloat16
+            self.gate_proj_scales = Parameter(
+                shape=[self.num_hidden_layers, 
+                       self.intermediate_size, 
+                       self.hidden_size // group_size],
+                dtype=trt.bfloat16,
+            ) #torch.Size([28, 6144, 16]) torch.bfloat16
+            self.down_proj_scales = Parameter(
+                shape=[self.num_hidden_layers, 
+                       self.hidden_size, 
+                       self.intermediate_size // group_size],
+                dtype=trt.bfloat16,
+            ) ## torch.Size([28, 2048, 48]) torch.bfloat16
 
     def prepare_inputs(self, max_batch_size, max_input_len, max_output_len):
         """ prepare build inputs """
@@ -159,7 +207,7 @@ class Qwen3MegaKernel(Module):
     def init_globals(self, hidden_states, input_lengths, **kwargs):
         """init globals"""
         assert self.instructions is not None, "instructions is not null"
-        return MKGlobals(
+        globs = MKGlobals(
             # hidden_states
             hidden_states,
             # input_lengths
@@ -188,7 +236,18 @@ class Qwen3MegaKernel(Module):
             kwargs.get("v_cache"),
             # batch size
             kwargs.get("bs_params"),
+            None
         )
+        if self.quant_type == "int4_sync_g128":
+            # add scales params
+            globs.scales_params = MKScalesParams(
+                self.qkv_proj_scales.value,
+                self.o_proj_scales.value,
+                self.up_proj_scales.value,
+                self.gate_proj_scales.value,
+                self.down_proj_scales.value,
+            )
+        return globs
 
     def forward(self, input_ids: Tensor, input_lengths: Tensor, **kwargs):
         """forward"""
@@ -213,5 +272,3 @@ class Qwen3MegaKernel(Module):
         logits.mark_output("logits", trt.float32)
         print("logits=", logits)
         return logits
-
-
