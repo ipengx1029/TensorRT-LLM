@@ -202,7 +202,7 @@ def main():
         # 在net_guard上下文中初始化Tensor
         network.set_named_parameters(model.named_parameters())
         model_kwargs = model.prepare_inputs(
-            args.max_batch_size, args.max_input_len, args.max_output_len)
+            args.max_batch_size, args.max_input_len, args.max_output_len, args.max_beam_width)
         print("model_kwargs=", model_kwargs)
         # 使用mkLlamaPlugin，传递所有参数
         model(**model_kwargs)

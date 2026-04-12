@@ -407,8 +407,9 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
     if (transformerBuffers)
     {
         transformerBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
-    } else if (mkBuffers) {
-        mkBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig);
+    }
+    if (mkBuffers) {
+        mkBuffers->postContextStep(this, contextBuffers, manager, modelConfig, worldConfig, !transformerBuffers.has_value());
     }
     if (rnnStateBuffers)
     {

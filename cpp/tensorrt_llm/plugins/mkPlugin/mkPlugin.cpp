@@ -130,7 +130,7 @@ DimsExprs MkPlugin::getOutputDimensions(int outputIndex,
 }
 bool MkPlugin::supportsFormatCombination(int pos, const PluginTensorDesc *inOut,
                                          int nbInputs, int nbOutputs) noexcept {
-    if (pos == 1 || pos == 2 || pos == 3 || pos == 4 || pos == 16 + mNumHiddenLayers) {
+    if (pos == 1 || pos == 2 || pos == 3 || pos == 4 || pos == 16 + mNumHiddenLayers || pos == 17 + mNumHiddenLayers) {
         // input_lengths, barrier, instructs, timeing, params
         return (inOut[pos].format == TensorFormat::kLINEAR && 
             inOut[pos].type == nvinfer1::DataType::kINT32);
@@ -265,6 +265,8 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
         convert2mktensor(mParams.kv_caches[l], (void *)inputs[idx + l], &inputDesc[idx + l].dims);
     }
     idx += mNumHiddenLayers;
+    mParams.beam_width = mParams.encoder ? 1 : inputDesc[idx].dims.d[1];
+    convert2mktensor(mParams.cache_indirection, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
     convert2mktensor(mParams.bs_params, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
 
     // Qwen qkv norm
@@ -272,18 +274,18 @@ int MkPlugin::enqueue(const PluginTensorDesc *inputDesc,
         convert2mktensor(mParams.q_norm_weights, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
         convert2mktensor(mParams.k_norm_weights, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
         if (mQuantType == 1) {
-            TLLM_CHECK_WITH_INFO(mNumInputs == 24 + mNumHiddenLayers, "MKPLugin qwen quant model need 24 + numlayers inputs");
+            TLLM_CHECK_WITH_INFO(mNumInputs == 25 + mNumHiddenLayers, "MKPLugin qwen quant model need 24 + numlayers inputs");
             update_gptq_gl_tensor(idx, inputDesc, inputs);
         } else {
-            TLLM_CHECK_WITH_INFO(mNumInputs == 19 + mNumHiddenLayers, "MKPLugin qwen model need 19 + numlayers inputs");
+            TLLM_CHECK_WITH_INFO(mNumInputs == 20 + mNumHiddenLayers, "MKPLugin qwen model need 19 + numlayers inputs");
         }
     } else if (mModelType == 2) { // for qwen2
         convert2mktensor(mParams.qkv_bias, (void *)inputs[idx], &inputDesc[idx].dims); idx++;
         if (mQuantType == 1) {
-            TLLM_CHECK_WITH_INFO(mNumInputs == 23 + mNumHiddenLayers, "MKPLugin qwen quant model need 23 + numlayers inputs");
+            TLLM_CHECK_WITH_INFO(mNumInputs == 24 + mNumHiddenLayers, "MKPLugin qwen quant model need 23 + numlayers inputs");
             update_gptq_gl_tensor(idx, inputDesc, inputs);
         } else {
-            TLLM_CHECK_WITH_INFO(mNumInputs == 18 + mNumHiddenLayers, "MKPLugin qwen model need 18 + numlayers inputs");
+            TLLM_CHECK_WITH_INFO(mNumInputs == 19 + mNumHiddenLayers, "MKPLugin qwen model need 18 + numlayers inputs");
         }
     } else if (mQuantType == 1) {
         update_gptq_gl_tensor(idx, inputDesc, inputs);

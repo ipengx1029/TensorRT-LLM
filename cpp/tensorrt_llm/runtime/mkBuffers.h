@@ -52,7 +52,7 @@ public:
     ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers, 
-    BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool is_pure_mk);
 
     void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step, BufferManager& manager,
         KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
@@ -63,7 +63,10 @@ public:
 
 protected:
     int make_bs_param(BufferManager& manager, ITensor &input_lengths_host);
-    int update_bs_param(BufferManager& manager, ITensor &input_lengths_host, SizeType32 new_token_num);
+    int update_bs_param(BufferManager& manager, ITensor &input_lengths_host, SizeType32 new_token_num, const int batch_size, const int beam_width);
+    void tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, bool is_pure_mk);
+
 public:
     // engine
     // TODO: use buffer from kvCacheManager 

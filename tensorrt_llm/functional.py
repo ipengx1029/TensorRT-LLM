@@ -5816,6 +5816,7 @@ class MKGlobals(object):
     input_lengths: Tensor
     # model parameters, all layers stacked together in order
     qkv_proj_weights: Tensor
+    qkv_proj_bias: Tensor
     attn_ln_weights: Tensor
     o_proj_weights: Tensor
     mlp_ln_weights: Tensor
@@ -5837,6 +5838,7 @@ class MKGlobals(object):
     barriers: Tensor
     # kvcache
     kv_caches: List[Tensor]
+    cache_indirection: Tensor
     # batch size
     bs_params: Tensor
     # scales params
@@ -5914,17 +5916,23 @@ def mk_plugin(
         "rope_cos", 
         "rope_sin",
     ] + kv_keys + [
+        "cache_indirection",
         "bs_params",
-        # qkv norm weight
-        "q_norm_weights",  #qwen
-        "k_norm_weights",  #qwen
     ]
 
+    if model_type in [1]: # 1 for qwen3
+        tensor_order += [
+            "q_norm_weights",
+            "k_norm_weights",
+        ]
+    elif model_type in [2]: # 2 for qwen2
+        tensor_order += [
+            "qkv_proj_bias",
+        ]
+
     plug_inputs = []
+    idx = 0
     for name in tensor_order:
-        # llama not need qk norm
-        if model_type == 0 and name in ["q_norm_weights", "k_norm_weights"]:
-            continue
         print(f"name: {name}")
         value = getattr(globals, name, None)
         if value is None:
@@ -5934,8 +5942,13 @@ def mk_plugin(
             else:
                 print(f"name: {name} found is None skip it")
                 continue
-        plug_inputs.append(value.trt_tensor)
-        print(f"add tensor: {name} is {value}")
+
+        trt_tensor = getattr(value, "trt_tensor", None)
+        if trt_tensor is None:      # if value is class: Parameter
+            trt_tensor = value.value.trt_tensor
+        plug_inputs.append(trt_tensor)
+        print(f"add tensor({idx}): {name} is {value}")
+        idx += 1
 
     if not globals.scales_params is None:
         for k, v in globals.scales_params.__dict__.items():

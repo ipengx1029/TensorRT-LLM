@@ -162,13 +162,21 @@ class QwenBaseMegaKernel(Module):
                 dtype=trt.bfloat16,
             ) ## torch.Size([28, 2048, 48]) torch.bfloat16
 
-    def prepare_inputs(self, max_batch_size, max_input_len, max_output_len):
+    def prepare_inputs(self, max_batch_size, max_input_len, max_output_len, max_beam_width):
         """ prepare build inputs """
+        def default_range(max_val, min_val=1):
+            return [[min_val, (max_val + 1) // 2, max_val]]
         # cache kv
-        bs_range = [[1, (max_batch_size + 1) // 2, max_batch_size]]
-        bs_range_inputlens = [[1, (max_batch_size + 1) // 2, max_batch_size * 2]]
+        bb_size = max_batch_size * max_beam_width
+        bs_range = default_range(max_batch_size)
+        bw_range = default_range(max_beam_width)
+        bb_range = default_range(bb_size)
+        bs_range_inputlens = [[1, (bb_size + 1) // 2, bb_size * 2]]
         max_seq_len = max_input_len + max_output_len
-        bs_max_input_len = max_batch_size * max_input_len
+        tokens_per_engine_step = 1
+        bs_max_input_len = max(
+            max_batch_size * max_input_len,
+            max_batch_size * max(tokens_per_engine_step, max_beam_width))
         input_range = [[1, (bs_max_input_len + 1) // 2, bs_max_input_len]]
         seq_range = [[1, (max_seq_len + 1) // 2, max_seq_len]]
 
@@ -195,7 +203,7 @@ class QwenBaseMegaKernel(Module):
         )
         kv_dim_range = OrderedDict(
             [
-                ("max_batchsize", bs_range),
+                ("batch_size_beam_width", bb_range),
                 ("kv", [2]),
                 ("num_key_value_heads", [self.num_key_value_heads]),
                 ("max_seq_len", seq_range),
@@ -212,8 +220,18 @@ class QwenBaseMegaKernel(Module):
             shape=[-1, 3],
             dtype=trt.int32,
             dim_range=OrderedDict(
-                [("max_batch_size", bs_range), ("bs_params_width", [3])]
+                [("batch_size_beam_width", bb_range), ("bs_params_width", [3])]
             ),
+        )
+        model_kwargs["cache_indirection"] = Tensor(
+            name='cache_indirection',
+            dtype=trt.int32,
+            shape=[-1, -1, -1],
+            dim_range=OrderedDict([
+                ('batch_size_cache', bs_range),
+                ('beam_width', bw_range),
+                ('max_seq_len', seq_range),
+            ]),
         )
         return model_kwargs
 
@@ -247,6 +265,7 @@ class QwenBaseMegaKernel(Module):
             self.barriers.value,
             # kvcache
             [kwargs.get(f"past_key_value_{i}") for i in range(self.num_hidden_layers)],
+            kwargs.get("cache_indirection"),
             # batch size
             kwargs.get("bs_params"),
             None

@@ -116,10 +116,55 @@ ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void MKBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers, 
-BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig) {
+void MKBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& manager, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, bool is_pure_mk)
+{
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    kernels::gatherLastTokenLogits(*(runtimeBuffers->logits), *logits_ptr_in_use, *(runtimeBuffers->lastTokenIds), manager.getStream());
+    auto& generationConfig = generation_config_;
+    auto& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
+    auto& contextLengthsHost = runtimeBuffers->contextLengthsHost;
+    auto const beamWidth = generationConfig.beamWidth;
+    TLLM_CHECK_WITH_INFO(beamWidth > 1, "Tiling is only necessary for beam search.");
+
+    if (is_pure_mk) {
+        utils::tileBufferReplace(contextLengthsDevice, beamWidth, manager);
+        utils::tileCpuBufferReplace(contextLengthsHost, beamWidth);
+    }
+
+    if (!modelConfig.usePagedKvCache()) {
+        for (auto& buffer : presentKeysVals) {
+            utils::tileBufferReplace(buffer, beamWidth, manager);
+        }
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void MKBuffers::postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers, 
+BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool is_pure_mk) {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto& generationConfig = generation_config_;
+    auto const batchSize = generationConfig.batchSize;
+    auto const beamWidth = generationConfig.beamWidth;
+    auto const bb_size = batchSize * beamWidth;
+
+    if (is_pure_mk) {
+        auto& logits = runtimeBuffers->logits;
+        auto logitsShape = logits->getShape();
+        logitsShape.d[1] *= beamWidth;
+        logits->reshape(logitsShape);
+        kernels::gatherLastTokenLogits(*(runtimeBuffers->logits), *logits_ptr_in_use, *(runtimeBuffers->lastTokenIds), manager.getStream());
+
+        if (beamWidth > 1) {
+            tile(runtimeBuffers, manager, modelConfig, worldConfig, is_pure_mk);
+        }
+    } else {
+        if (beamWidth > 1) {
+            presentKeysVals = runtimeBuffers->transformerBuffers->presentKeysVals;
+        }
+    }
+    input_lengths->reshape(ITensor::makeShape({bb_size + 1}));
+    bs_params->reshape(ITensor::makeShape({bb_size, 3}));
+    bs_host_params->reshape(ITensor::makeShape({bb_size, 3}));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -128,10 +173,14 @@ void MKBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step,
     WorldConfig const& worldConfig) {
     TLLM_LOG_TRACE("%s start, step: %d", __PRETTY_FUNCTION__, step);
     const int vocabSize = modelConfig.getVocabSize();
-    const int batchSize = generation_config_.batchSize;
+    auto& generationConfig = generation_config_;
+    auto const batchSize = generationConfig.batchSize;
+    auto const beamWidth = generationConfig.beamWidth;
+    auto bb_size = batchSize * beamWidth;
+
     int new_token_num = 1;
     int* input_lengths_ptr = (int*)input_lengths->data();
-    for (int i = 0; i < batchSize; ++i) {
+    for (int i = 0; i < bb_size; ++i) {
         input_lengths_ptr[i] = 1;
     }
     if (seq_len_ == 0) {
@@ -139,14 +188,15 @@ void MKBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step,
         seq_len_ = BufferRange<SizeType32>(*(runtimeBuffers->contextLengthsHost))[0];
     }
     // add seq offset for next tokens
-    input_lengths_ptr[batchSize] = seq_len_;
+    input_lengths_ptr[bb_size] = seq_len_;
 
-    if (batchSize > 1) {
-        new_token_num = update_bs_param(manager, *(runtimeBuffers->contextLengthsHost), step);
+    if (batchSize > 1 || beamWidth > 1) {
+        update_bs_param(manager, *(runtimeBuffers->contextLengthsHost), step, batchSize, beamWidth);
+        new_token_num = bb_size;
     }
 
     seq_len_ += new_token_num;
-    runtimeBuffers->logits->reshape(ITensor::makeShape({new_token_num, 1, vocabSize})); // TODO support beamsearch
+    runtimeBuffers->logits->reshape(ITensor::makeShape({batchSize, beamWidth, vocabSize}));
     logits_ptr_in_use = ITensor::view(runtimeBuffers->logits, ITensor::makeShape({new_token_num, vocabSize}));
     TLLM_LOG_TRACE("%s stop, step: %d, batch: %d, seq_len: %d", __PRETTY_FUNCTION__, step, batchSize, seq_len_);
 }
@@ -159,6 +209,7 @@ void MKBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMa
 
     outputBuffers.insert_or_assign("logits", ITensor::view(logits_ptr_in_use));
 
+    inputBuffers.insert_or_assign("cache_indirection", runtimeBuffers->cacheIndirectionDecoderOutput);
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
     auto const& layerTypes = modelConfig.getLayerTypes();
@@ -184,24 +235,27 @@ int MKBuffers::make_bs_param(BufferManager& manager, ITensor &input_lengths_host
         bs_params_host[idx++] = 0;
         input_lengths_ptr[i] = len;
         offset += len;
+        TLLM_LOG_TRACE("make_bs_param %d: %d, %d, %d", i, offset, len, 0);
     }
     bs_params->reshape(ITensor::makeShape({batch_size, 3}));
     manager.copy(bs_params_host, *bs_params, MemoryType::kGPU);
     return offset;
 }
 
-int MKBuffers::update_bs_param(BufferManager& manager, ITensor &input_lengths_host, SizeType32 new_token_num) {
-    const int batch_size = generation_config_.batchSize;
+int MKBuffers::update_bs_param(BufferManager& manager, ITensor &input_lengths_host, SizeType32 new_token_num, const int batch_size, const int beam_width) {
     int* bs_params_host = bufferCast<int>(*bs_host_params);
     int idx = 0;
     auto input_lengths_buffer = BufferRange<SizeType32>(input_lengths_host);
     for (int i = 0; i < batch_size; ++i) {
-        int len = input_lengths_buffer[i];
-        bs_params_host[idx++] = i;
-        bs_params_host[idx++] = 1;
-        bs_params_host[idx++] = len + new_token_num;
+        for (int j = 0; j < beam_width; ++j) {
+            int len = input_lengths_buffer[i * beam_width + j];
+            bs_params_host[idx++] = i * beam_width + j;
+            bs_params_host[idx++] = 1;
+            bs_params_host[idx++] = len + new_token_num;
+            TLLM_LOG_TRACE("update_bs_param bs%d-bw%d: %d, %d, %d", i, j, i * beam_width + j, 1, len + new_token_num);
+        }
     }
-    bs_params->reshape(ITensor::makeShape({batch_size, 3}));
+    bs_params->reshape(ITensor::makeShape({batch_size * beam_width, 3}));
     manager.copy(bs_params_host, *bs_params, MemoryType::kGPU);
-    return batch_size;
+    return batch_size * beam_width;
 }
